@@ -5,11 +5,14 @@ package genericconf
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"time"
 
-	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/rpc"
 	flag "github.com/spf13/pflag"
+
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/node"
 )
 
 type ConfConfig struct {
@@ -33,7 +36,7 @@ func ConfConfigAddOptions(prefix string, f *flag.FlagSet) {
 var ConfConfigDefault = ConfConfig{
 	Dump:           false,
 	EnvPrefix:      "",
-	File:           nil,
+	File:           []string{},
 	S3:             DefaultS3Config,
 	String:         "",
 	ReloadInterval: 0,
@@ -63,11 +66,11 @@ var DefaultS3Config = S3Config{
 	SecretKey: "",
 }
 
-func ParseLogType(logType string) (log.Format, error) {
+func HandlerFromLogType(logType string, output io.Writer) (slog.Handler, error) {
 	if logType == "plaintext" {
-		return log.TerminalFormat(false), nil
+		return log.NewTerminalHandler(output, false), nil
 	} else if logType == "json" {
-		return log.JSONFormat(), nil
+		return log.JSONHandler(output), nil
 	}
 	return nil, errors.New("invalid log type")
 }
@@ -107,16 +110,20 @@ func FileLoggingConfigAddOptions(prefix string, f *flag.FlagSet) {
 
 type RpcConfig struct {
 	MaxBatchResponseSize int `koanf:"max-batch-response-size"`
+	BatchRequestLimit    int `koanf:"batch-request-limit"`
 }
 
 var DefaultRpcConfig = RpcConfig{
 	MaxBatchResponseSize: 10_000_000, // 10MB
+	BatchRequestLimit:    node.DefaultConfig.BatchRequestLimit,
 }
 
-func (c *RpcConfig) Apply() {
-	rpc.MaxBatchResponseSize = c.MaxBatchResponseSize
+func (c *RpcConfig) Apply(stackConf *node.Config) {
+	stackConf.BatchResponseMaxSize = c.MaxBatchResponseSize
+	stackConf.BatchRequestLimit = c.BatchRequestLimit
 }
 
 func RpcConfigAddOptions(prefix string, f *flag.FlagSet) {
-	f.Int(prefix+".max-batch-response-size", DefaultRpcConfig.MaxBatchResponseSize, "the maximum response size for a JSON-RPC request measured in bytes (-1 means no limit)")
+	f.Int(prefix+".max-batch-response-size", DefaultRpcConfig.MaxBatchResponseSize, "the maximum response size for a JSON-RPC request measured in bytes (0 means no limit)")
+	f.Int(prefix+".batch-request-limit", DefaultRpcConfig.BatchRequestLimit, "the maximum number of requests in a batch (0 means no limit)")
 }

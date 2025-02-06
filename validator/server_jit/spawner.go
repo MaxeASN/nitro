@@ -2,14 +2,16 @@ package server_jit
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime"
 	"sync/atomic"
+	"time"
 
 	flag "github.com/spf13/pflag"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/ethdb"
 
 	"github.com/offchainlabs/nitro/util/stopwaiter"
 	"github.com/offchainlabs/nitro/validator"
@@ -17,25 +19,33 @@ import (
 )
 
 type JitSpawnerConfig struct {
-	Workers   int  `koanf:"workers" reload:"hot"`
-	Cranelift bool `koanf:"cranelift"`
+	Workers          int           `koanf:"workers" reload:"hot"`
+	Cranelift        bool          `koanf:"cranelift"`
+	MaxExecutionTime time.Duration `koanf:"max-execution-time" reload:"hot"`
+
+	// TODO: change WasmMemoryUsageLimit to a string and use resourcemanager.ParseMemLimit
+	WasmMemoryUsageLimit int `koanf:"wasm-memory-usage-limit"`
 }
 
 type JitSpawnerConfigFecher func() *JitSpawnerConfig
 
 var DefaultJitSpawnerConfig = JitSpawnerConfig{
-	Workers:   0,
-	Cranelift: true,
+	Workers:              0,
+	Cranelift:            true,
+	WasmMemoryUsageLimit: 4294967296, // 2^32 WASM memory limit
+	MaxExecutionTime:     time.Minute * 10,
 }
 
 func JitSpawnerConfigAddOptions(prefix string, f *flag.FlagSet) {
 	f.Int(prefix+".workers", DefaultJitSpawnerConfig.Workers, "number of concurrent validation threads")
 	f.Bool(prefix+".cranelift", DefaultJitSpawnerConfig.Cranelift, "use Cranelift instead of LLVM when validating blocks using the jit-accelerated block validator")
+	f.Int(prefix+".wasm-memory-usage-limit", DefaultJitSpawnerConfig.WasmMemoryUsageLimit, "if memory used by a jit wasm exceeds this limit, a warning is logged")
+	f.Duration(prefix+".max-execution-time", DefaultJitSpawnerConfig.MaxExecutionTime, "if execution time used by a jit wasm exceeds this limit, a rpc error is returned")
 }
 
 type JitSpawner struct {
 	stopwaiter.StopWaiter
-	count         int32
+	count         atomic.Int32
 	locator       *server_common.MachineLocator
 	machineLoader *JitMachineLoader
 	config        JitSpawnerConfigFecher
@@ -45,7 +55,9 @@ func NewJitSpawner(locator *server_common.MachineLocator, config JitSpawnerConfi
 	// TODO - preload machines
 	machineConfig := DefaultJitMachineConfig
 	machineConfig.JitCranelift = config().Cranelift
-	loader, err := NewJitMachineLoader(&machineConfig, locator, fatalErrChan)
+	machineConfig.WasmMemoryUsageLimit = config().WasmMemoryUsageLimit
+	maxExecutionTime := config().MaxExecutionTime
+	loader, err := NewJitMachineLoader(&machineConfig, locator, maxExecutionTime, fatalErrChan)
 	if err != nil {
 		return nil, err
 	}
@@ -62,22 +74,23 @@ func (v *JitSpawner) Start(ctx_in context.Context) error {
 	return nil
 }
 
+func (v *JitSpawner) WasmModuleRoots() ([]common.Hash, error) {
+	return v.locator.ModuleRoots(), nil
+}
+
+func (v *JitSpawner) StylusArchs() []ethdb.WasmTarget {
+	return []ethdb.WasmTarget{rawdb.LocalTarget()}
+}
+
 func (v *JitSpawner) execute(
 	ctx context.Context, entry *validator.ValidationInput, moduleRoot common.Hash,
 ) (validator.GoGlobalState, error) {
 	machine, err := v.machineLoader.GetMachine(ctx, moduleRoot)
 	if err != nil {
-		return validator.GoGlobalState{}, fmt.Errorf("unabled to get WASM machine: %w", err)
+		return validator.GoGlobalState{}, fmt.Errorf("unable to get WASM machine: %w", err)
 	}
 
-	resolver := func(hash common.Hash) ([]byte, error) {
-		// Check if it's a known preimage
-		if preimage, ok := entry.Preimages[hash]; ok {
-			return preimage, nil
-		}
-		return nil, errors.New("preimage not found")
-	}
-	state, err := machine.prove(ctx, entry, resolver)
+	state, err := machine.prove(ctx, entry)
 	return state, err
 }
 
@@ -89,9 +102,9 @@ func (s *JitSpawner) Name() string {
 }
 
 func (v *JitSpawner) Launch(entry *validator.ValidationInput, moduleRoot common.Hash) validator.ValidationRun {
-	atomic.AddInt32(&v.count, 1)
+	v.count.Add(1)
 	promise := stopwaiter.LaunchPromiseThread[validator.GoGlobalState](v, func(ctx context.Context) (validator.GoGlobalState, error) {
-		defer atomic.AddInt32(&v.count, -1)
+		defer v.count.Add(-1)
 		return v.execute(ctx, entry, moduleRoot)
 	})
 	return server_common.NewValRun(promise, moduleRoot)

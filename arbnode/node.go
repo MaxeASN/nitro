@@ -9,204 +9,50 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	flag "github.com/spf13/pflag"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	"github.com/ethereum/go-ethereum/arbitrum"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/eth"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
+
 	"github.com/offchainlabs/nitro/arbnode/dataposter"
 	"github.com/offchainlabs/nitro/arbnode/dataposter/storage"
-	"github.com/offchainlabs/nitro/arbnode/execution"
-	"github.com/offchainlabs/nitro/arbnode/redislock"
 	"github.com/offchainlabs/nitro/arbnode/resourcemanager"
+	"github.com/offchainlabs/nitro/arbos/arbostypes"
+	"github.com/offchainlabs/nitro/arbstate/daprovider"
 	"github.com/offchainlabs/nitro/arbutil"
 	"github.com/offchainlabs/nitro/broadcastclient"
 	"github.com/offchainlabs/nitro/broadcastclients"
 	"github.com/offchainlabs/nitro/broadcaster"
 	"github.com/offchainlabs/nitro/cmd/chaininfo"
 	"github.com/offchainlabs/nitro/das"
+	"github.com/offchainlabs/nitro/execution"
+	"github.com/offchainlabs/nitro/execution/gethexec"
 	"github.com/offchainlabs/nitro/solgen/go/bridgegen"
-	"github.com/offchainlabs/nitro/solgen/go/challengegen"
-	"github.com/offchainlabs/nitro/solgen/go/ospgen"
 	"github.com/offchainlabs/nitro/solgen/go/precompilesgen"
 	"github.com/offchainlabs/nitro/solgen/go/rollupgen"
 	"github.com/offchainlabs/nitro/staker"
+	boldstaker "github.com/offchainlabs/nitro/staker/bold"
+	legacystaker "github.com/offchainlabs/nitro/staker/legacy"
+	multiprotocolstaker "github.com/offchainlabs/nitro/staker/multi_protocol"
+	"github.com/offchainlabs/nitro/staker/validatorwallet"
 	"github.com/offchainlabs/nitro/util/contracts"
 	"github.com/offchainlabs/nitro/util/headerreader"
 	"github.com/offchainlabs/nitro/util/redisutil"
+	"github.com/offchainlabs/nitro/util/rpcclient"
 	"github.com/offchainlabs/nitro/util/signature"
 	"github.com/offchainlabs/nitro/wsbroadcastserver"
 )
-
-func andTxSucceeded(ctx context.Context, l1Reader *headerreader.HeaderReader, tx *types.Transaction, err error) error {
-	if err != nil {
-		return fmt.Errorf("error submitting tx: %w", err)
-	}
-	_, err = l1Reader.WaitForTxApproval(ctx, tx)
-	if err != nil {
-		return fmt.Errorf("error executing tx: %w", err)
-	}
-	return nil
-}
-
-func deployBridgeCreator(ctx context.Context, l1Reader *headerreader.HeaderReader, auth *bind.TransactOpts) (common.Address, error) {
-	client := l1Reader.Client()
-	bridgeTemplate, tx, _, err := bridgegen.DeployBridge(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("bridge deploy error: %w", err)
-	}
-
-	seqInboxTemplate, tx, _, err := bridgegen.DeploySequencerInbox(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("sequencer inbox deploy error: %w", err)
-	}
-
-	inboxTemplate, tx, _, err := bridgegen.DeployInbox(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("inbox deploy error: %w", err)
-	}
-
-	rollupEventBridgeTemplate, tx, _, err := rollupgen.DeployRollupEventInbox(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("rollup event bridge deploy error: %w", err)
-	}
-
-	outboxTemplate, tx, _, err := bridgegen.DeployOutbox(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("outbox deploy error: %w", err)
-	}
-
-	bridgeCreatorAddr, tx, bridgeCreator, err := rollupgen.DeployBridgeCreator(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("bridge creator deploy error: %w", err)
-	}
-
-	tx, err = bridgeCreator.UpdateTemplates(auth, bridgeTemplate, seqInboxTemplate, inboxTemplate, rollupEventBridgeTemplate, outboxTemplate)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("bridge creator update templates error: %w", err)
-	}
-
-	return bridgeCreatorAddr, nil
-}
-
-func deployChallengeFactory(ctx context.Context, l1Reader *headerreader.HeaderReader, auth *bind.TransactOpts) (common.Address, common.Address, error) {
-	client := l1Reader.Client()
-	osp0, tx, _, err := ospgen.DeployOneStepProver0(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, common.Address{}, fmt.Errorf("osp0 deploy error: %w", err)
-	}
-
-	ospMem, _, _, err := ospgen.DeployOneStepProverMemory(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, common.Address{}, fmt.Errorf("ospMemory deploy error: %w", err)
-	}
-
-	ospMath, _, _, err := ospgen.DeployOneStepProverMath(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, common.Address{}, fmt.Errorf("ospMath deploy error: %w", err)
-	}
-
-	ospHostIo, _, _, err := ospgen.DeployOneStepProverHostIo(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, common.Address{}, fmt.Errorf("ospHostIo deploy error: %w", err)
-	}
-
-	ospEntryAddr, tx, _, err := ospgen.DeployOneStepProofEntry(auth, client, osp0, ospMem, ospMath, ospHostIo)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, common.Address{}, fmt.Errorf("ospEntry deploy error: %w", err)
-	}
-
-	challengeManagerAddr, tx, _, err := challengegen.DeployChallengeManager(auth, client)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return common.Address{}, common.Address{}, fmt.Errorf("ospEntry deploy error: %w", err)
-	}
-
-	return ospEntryAddr, challengeManagerAddr, nil
-}
-
-func deployRollupCreator(ctx context.Context, l1Reader *headerreader.HeaderReader, auth *bind.TransactOpts) (*rollupgen.RollupCreator, common.Address, common.Address, common.Address, error) {
-	bridgeCreator, err := deployBridgeCreator(ctx, l1Reader, auth)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, err
-	}
-
-	ospEntryAddr, challengeManagerAddr, err := deployChallengeFactory(ctx, l1Reader, auth)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, err
-	}
-
-	rollupAdminLogic, tx, _, err := rollupgen.DeployRollupAdminLogic(auth, l1Reader.Client())
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, fmt.Errorf("rollup admin logic deploy error: %w", err)
-	}
-
-	rollupUserLogic, tx, _, err := rollupgen.DeployRollupUserLogic(auth, l1Reader.Client())
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, fmt.Errorf("rollup user logic deploy error: %w", err)
-	}
-
-	rollupCreatorAddress, tx, rollupCreator, err := rollupgen.DeployRollupCreator(auth, l1Reader.Client())
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, fmt.Errorf("rollup creator deploy error: %w", err)
-	}
-
-	validatorUtils, tx, _, err := rollupgen.DeployValidatorUtils(auth, l1Reader.Client())
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, fmt.Errorf("validator utils deploy error: %w", err)
-	}
-
-	validatorWalletCreator, tx, _, err := rollupgen.DeployValidatorWalletCreator(auth, l1Reader.Client())
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, fmt.Errorf("validator wallet creator deploy error: %w", err)
-	}
-
-	tx, err = rollupCreator.SetTemplates(
-		auth,
-		bridgeCreator,
-		ospEntryAddr,
-		challengeManagerAddr,
-		rollupAdminLogic,
-		rollupUserLogic,
-		validatorUtils,
-		validatorWalletCreator,
-	)
-	err = andTxSucceeded(ctx, l1Reader, tx, err)
-	if err != nil {
-		return nil, common.Address{}, common.Address{}, common.Address{}, fmt.Errorf("rollup set template error: %w", err)
-	}
-
-	return rollupCreator, rollupCreatorAddress, validatorUtils, validatorWalletCreator, nil
-}
 
 func GenerateRollupConfig(prod bool, wasmModuleRoot common.Hash, rollupOwner common.Address, chainConfig *params.ChainConfig, serializedChainConfig []byte, loserStakeEscrow common.Address) rollupgen.Config {
 	var confirmPeriod uint64
@@ -235,86 +81,42 @@ func GenerateRollupConfig(prod bool, wasmModuleRoot common.Hash, rollupOwner com
 	}
 }
 
-func DeployOnL1(ctx context.Context, parentChainReader *headerreader.HeaderReader, deployAuth *bind.TransactOpts, batchPoster common.Address, authorizeValidators uint64, config rollupgen.Config) (*chaininfo.RollupAddresses, error) {
-	if config.WasmModuleRoot == (common.Hash{}) {
-		return nil, errors.New("no machine specified")
-	}
-
-	rollupCreator, _, validatorUtils, validatorWalletCreator, err := deployRollupCreator(ctx, parentChainReader, deployAuth)
-	if err != nil {
-		return nil, fmt.Errorf("error deploying rollup creator: %w", err)
-	}
-
-	var validatorAddrs []common.Address
-	for i := uint64(1); i <= authorizeValidators; i++ {
-		validatorAddrs = append(validatorAddrs, crypto.CreateAddress(validatorWalletCreator, i))
-	}
-
-	tx, err := rollupCreator.CreateRollup(
-		deployAuth,
-		config,
-		batchPoster,
-		validatorAddrs,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error submitting create rollup tx: %w", err)
-	}
-	receipt, err := parentChainReader.WaitForTxApproval(ctx, tx)
-	if err != nil {
-		return nil, fmt.Errorf("error executing create rollup tx: %w", err)
-	}
-	info, err := rollupCreator.ParseRollupCreated(*receipt.Logs[len(receipt.Logs)-1])
-	if err != nil {
-		return nil, fmt.Errorf("error parsing rollup created log: %w", err)
-	}
-
-	return &chaininfo.RollupAddresses{
-		Bridge:                 info.Bridge,
-		Inbox:                  info.InboxAddress,
-		SequencerInbox:         info.SequencerInbox,
-		DeployedAt:             receipt.BlockNumber.Uint64(),
-		Rollup:                 info.RollupAddress,
-		ValidatorUtils:         validatorUtils,
-		ValidatorWalletCreator: validatorWalletCreator,
-	}, nil
-}
-
 type Config struct {
-	RPC                 arbitrum.Config                  `koanf:"rpc"`
-	Sequencer           execution.SequencerConfig        `koanf:"sequencer" reload:"hot"`
-	ParentChainReader   headerreader.Config              `koanf:"parent-chain-reader" reload:"hot"`
-	InboxReader         InboxReaderConfig                `koanf:"inbox-reader" reload:"hot"`
-	DelayedSequencer    DelayedSequencerConfig           `koanf:"delayed-sequencer" reload:"hot"`
-	BatchPoster         BatchPosterConfig                `koanf:"batch-poster" reload:"hot"`
-	MessagePruner       MessagePrunerConfig              `koanf:"message-pruner" reload:"hot"`
-	ForwardingTarget    string                           `koanf:"forwarding-target"`
-	Forwarder           execution.ForwarderConfig        `koanf:"forwarder"`
-	TxPreChecker        execution.TxPreCheckerConfig     `koanf:"tx-pre-checker" reload:"hot"`
-	BlockValidator      staker.BlockValidatorConfig      `koanf:"block-validator" reload:"hot"`
-	RecordingDatabase   arbitrum.RecordingDatabaseConfig `koanf:"recording-database"`
-	Feed                broadcastclient.FeedConfig       `koanf:"feed" reload:"hot"`
-	Staker              staker.L1ValidatorConfig         `koanf:"staker" reload:"hot"`
-	SeqCoordinator      SeqCoordinatorConfig             `koanf:"seq-coordinator"`
-	DataAvailability    das.DataAvailabilityConfig       `koanf:"data-availability"`
-	SyncMonitor         SyncMonitorConfig                `koanf:"sync-monitor"`
-	Dangerous           DangerousConfig                  `koanf:"dangerous"`
-	Caching             execution.CachingConfig          `koanf:"caching"`
-	Archive             bool                             `koanf:"archive"`
-	TxLookupLimit       uint64                           `koanf:"tx-lookup-limit"`
-	TransactionStreamer TransactionStreamerConfig        `koanf:"transaction-streamer" reload:"hot"`
-	Maintenance         MaintenanceConfig                `koanf:"maintenance" reload:"hot"`
-	ResourceMgmt        resourcemanager.Config           `koanf:"resource-mgmt" reload:"hot"`
+	Sequencer            bool                           `koanf:"sequencer"`
+	ParentChainReader    headerreader.Config            `koanf:"parent-chain-reader" reload:"hot"`
+	InboxReader          InboxReaderConfig              `koanf:"inbox-reader" reload:"hot"`
+	DelayedSequencer     DelayedSequencerConfig         `koanf:"delayed-sequencer" reload:"hot"`
+	BatchPoster          BatchPosterConfig              `koanf:"batch-poster" reload:"hot"`
+	MessagePruner        MessagePrunerConfig            `koanf:"message-pruner" reload:"hot"`
+	BlockValidator       staker.BlockValidatorConfig    `koanf:"block-validator" reload:"hot"`
+	Feed                 broadcastclient.FeedConfig     `koanf:"feed" reload:"hot"`
+	Staker               legacystaker.L1ValidatorConfig `koanf:"staker" reload:"hot"`
+	Bold                 boldstaker.BoldConfig          `koanf:"bold"`
+	SeqCoordinator       SeqCoordinatorConfig           `koanf:"seq-coordinator"`
+	DataAvailability     das.DataAvailabilityConfig     `koanf:"data-availability"`
+	SyncMonitor          SyncMonitorConfig              `koanf:"sync-monitor"`
+	Dangerous            DangerousConfig                `koanf:"dangerous"`
+	TransactionStreamer  TransactionStreamerConfig      `koanf:"transaction-streamer" reload:"hot"`
+	Maintenance          MaintenanceConfig              `koanf:"maintenance" reload:"hot"`
+	ResourceMgmt         resourcemanager.Config         `koanf:"resource-mgmt" reload:"hot"`
+	BlockMetadataFetcher BlockMetadataFetcherConfig     `koanf:"block-metadata-fetcher" reload:"hot"`
+	// SnapSyncConfig is only used for testing purposes, these should not be configured in production.
+	SnapSyncTest SnapSyncConfig
 }
 
 func (c *Config) Validate() error {
-	if c.ParentChainReader.Enable && c.Sequencer.Enable && !c.DelayedSequencer.Enable {
+	if c.ParentChainReader.Enable && c.Sequencer && !c.DelayedSequencer.Enable {
 		log.Warn("delayed sequencer is not enabled, despite sequencer and l1 reader being enabled")
 	}
-	if c.DelayedSequencer.Enable && !c.Sequencer.Enable {
+	if c.DelayedSequencer.Enable && !c.Sequencer {
 		return errors.New("cannot enable delayed sequencer without enabling sequencer")
 	}
-	if err := c.Sequencer.Validate(); err != nil {
-		return err
+	if c.InboxReader.ReadMode != "latest" {
+		if c.Sequencer {
+			return errors.New("cannot enable inboxreader in safe or finalized mode along with sequencer")
+		}
+		c.Feed.Output.Enable = false
+		c.Feed.Input.URL = []string{}
 	}
 	if err := c.BlockValidator.Validate(); err != nil {
 		return err
@@ -334,15 +136,10 @@ func (c *Config) Validate() error {
 	if err := c.Staker.Validate(); err != nil {
 		return err
 	}
-	return nil
-}
-
-func (c *Config) ForwardingTargetF() string {
-	if c.ForwardingTarget == "null" {
-		return ""
+	if c.TransactionStreamer.TrackBlockMetadataFrom != 0 && !c.BlockMetadataFetcher.Enable {
+		log.Warn("track-block-metadata-from is set but blockMetadata fetcher is not enabled")
 	}
-
-	return c.ForwardingTarget
+	return nil
 }
 
 func (c *Config) ValidatorRequired() bool {
@@ -356,123 +153,127 @@ func (c *Config) ValidatorRequired() bool {
 }
 
 func ConfigAddOptions(prefix string, f *flag.FlagSet, feedInputEnable bool, feedOutputEnable bool) {
-	arbitrum.ConfigAddOptions(prefix+".rpc", f)
-	execution.SequencerConfigAddOptions(prefix+".sequencer", f)
+	f.Bool(prefix+".sequencer", ConfigDefault.Sequencer, "enable sequencer")
 	headerreader.AddOptions(prefix+".parent-chain-reader", f)
 	InboxReaderConfigAddOptions(prefix+".inbox-reader", f)
 	DelayedSequencerConfigAddOptions(prefix+".delayed-sequencer", f)
 	BatchPosterConfigAddOptions(prefix+".batch-poster", f)
 	MessagePrunerConfigAddOptions(prefix+".message-pruner", f)
-	f.String(prefix+".forwarding-target", ConfigDefault.ForwardingTarget, "transaction forwarding target URL, or \"null\" to disable forwarding (if not sequencer)")
-	execution.AddOptionsForNodeForwarderConfig(prefix+".forwarder", f)
-	execution.TxPreCheckerConfigAddOptions(prefix+".tx-pre-checker", f)
 	staker.BlockValidatorConfigAddOptions(prefix+".block-validator", f)
-	arbitrum.RecordingDatabaseConfigAddOptions(prefix+".recording-database", f)
 	broadcastclient.FeedConfigAddOptions(prefix+".feed", f, feedInputEnable, feedOutputEnable)
-	staker.L1ValidatorConfigAddOptions(prefix+".staker", f)
+	legacystaker.L1ValidatorConfigAddOptions(prefix+".staker", f)
+	boldstaker.BoldConfigAddOptions(prefix+".bold", f)
 	SeqCoordinatorConfigAddOptions(prefix+".seq-coordinator", f)
 	das.DataAvailabilityConfigAddNodeOptions(prefix+".data-availability", f)
 	SyncMonitorConfigAddOptions(prefix+".sync-monitor", f)
 	DangerousConfigAddOptions(prefix+".dangerous", f)
-	execution.CachingConfigAddOptions(prefix+".caching", f)
-	f.Uint64(prefix+".tx-lookup-limit", ConfigDefault.TxLookupLimit, "retain the ability to lookup transactions by hash for the past N blocks (0 = all blocks)")
 	TransactionStreamerConfigAddOptions(prefix+".transaction-streamer", f)
 	MaintenanceConfigAddOptions(prefix+".maintenance", f)
-	resourcemanager.ConfigAddOptions(prefix+".resource-mgmt", f)
-
-	archiveMsg := fmt.Sprintf("retain past block state (deprecated, please use %v.caching.archive)", prefix)
-	f.Bool(prefix+".archive", ConfigDefault.Archive, archiveMsg)
+	BlockMetadataFetcherConfigAddOptions(prefix+".block-metadata-fetcher", f)
 }
 
 var ConfigDefault = Config{
-	RPC:                 arbitrum.DefaultConfig,
-	Sequencer:           execution.DefaultSequencerConfig,
-	ParentChainReader:   headerreader.DefaultConfig,
-	InboxReader:         DefaultInboxReaderConfig,
-	DelayedSequencer:    DefaultDelayedSequencerConfig,
-	BatchPoster:         DefaultBatchPosterConfig,
-	MessagePruner:       DefaultMessagePrunerConfig,
-	ForwardingTarget:    "",
-	TxPreChecker:        execution.DefaultTxPreCheckerConfig,
-	BlockValidator:      staker.DefaultBlockValidatorConfig,
-	RecordingDatabase:   arbitrum.DefaultRecordingDatabaseConfig,
-	Feed:                broadcastclient.FeedConfigDefault,
-	Staker:              staker.DefaultL1ValidatorConfig,
-	SeqCoordinator:      DefaultSeqCoordinatorConfig,
-	DataAvailability:    das.DefaultDataAvailabilityConfig,
-	SyncMonitor:         DefaultSyncMonitorConfig,
-	Dangerous:           DefaultDangerousConfig,
-	Archive:             false,
-	TxLookupLimit:       126_230_400, // 1 year at 4 blocks per second
-	Caching:             execution.DefaultCachingConfig,
-	TransactionStreamer: DefaultTransactionStreamerConfig,
-	ResourceMgmt:        resourcemanager.DefaultConfig,
+	Sequencer:            false,
+	ParentChainReader:    headerreader.DefaultConfig,
+	InboxReader:          DefaultInboxReaderConfig,
+	DelayedSequencer:     DefaultDelayedSequencerConfig,
+	BatchPoster:          DefaultBatchPosterConfig,
+	MessagePruner:        DefaultMessagePrunerConfig,
+	BlockValidator:       staker.DefaultBlockValidatorConfig,
+	Feed:                 broadcastclient.FeedConfigDefault,
+	Staker:               legacystaker.DefaultL1ValidatorConfig,
+	Bold:                 boldstaker.DefaultBoldConfig,
+	SeqCoordinator:       DefaultSeqCoordinatorConfig,
+	DataAvailability:     das.DefaultDataAvailabilityConfig,
+	SyncMonitor:          DefaultSyncMonitorConfig,
+	Dangerous:            DefaultDangerousConfig,
+	TransactionStreamer:  DefaultTransactionStreamerConfig,
+	ResourceMgmt:         resourcemanager.DefaultConfig,
+	Maintenance:          DefaultMaintenanceConfig,
+	BlockMetadataFetcher: DefaultBlockMetadataFetcherConfig,
+	SnapSyncTest:         DefaultSnapSyncConfig,
 }
 
 func ConfigDefaultL1Test() *Config {
 	config := ConfigDefaultL1NonSequencerTest()
-	config.Sequencer = execution.TestSequencerConfig
 	config.DelayedSequencer = TestDelayedSequencerConfig
 	config.BatchPoster = TestBatchPosterConfig
 	config.SeqCoordinator = TestSeqCoordinatorConfig
+	config.Sequencer = true
+	config.Dangerous.NoSequencerCoordinator = true
 
 	return config
 }
 
 func ConfigDefaultL1NonSequencerTest() *Config {
 	config := ConfigDefault
+	config.Dangerous = TestDangerousConfig
 	config.ParentChainReader = headerreader.TestConfig
 	config.InboxReader = TestInboxReaderConfig
-	config.Sequencer.Enable = false
 	config.DelayedSequencer.Enable = false
 	config.BatchPoster.Enable = false
 	config.SeqCoordinator.Enable = false
 	config.BlockValidator = staker.TestBlockValidatorConfig
-	config.Staker = staker.TestL1ValidatorConfig
+	config.SyncMonitor = TestSyncMonitorConfig
+	config.Staker = legacystaker.TestL1ValidatorConfig
 	config.Staker.Enable = false
-	config.BlockValidator.ValidationServer.URL = ""
-	config.Forwarder = execution.DefaultTestForwarderConfig
-	config.TransactionStreamer = DefaultTransactionStreamerConfig
+	config.BlockValidator.ValidationServerConfigs = []rpcclient.ClientConfig{{URL: ""}}
+	config.Bold.MinimumGapToParentAssertion = 0
 
 	return &config
 }
 
 func ConfigDefaultL2Test() *Config {
 	config := ConfigDefault
-	config.Sequencer = execution.TestSequencerConfig
+	config.Dangerous = TestDangerousConfig
 	config.ParentChainReader.Enable = false
 	config.SeqCoordinator = TestSeqCoordinatorConfig
 	config.Feed.Input.Verify.Dangerous.AcceptMissing = true
 	config.Feed.Output.Signed = false
 	config.SeqCoordinator.Signer.ECDSA.AcceptSequencer = false
 	config.SeqCoordinator.Signer.ECDSA.Dangerous.AcceptMissing = true
-	config.Staker = staker.TestL1ValidatorConfig
+	config.Staker = legacystaker.TestL1ValidatorConfig
+	config.SyncMonitor = TestSyncMonitorConfig
 	config.Staker.Enable = false
-	config.BlockValidator.ValidationServer.URL = ""
+	config.BlockValidator.ValidationServerConfigs = []rpcclient.ClientConfig{{URL: ""}}
 	config.TransactionStreamer = DefaultTransactionStreamerConfig
+	config.Bold.MinimumGapToParentAssertion = 0
 
 	return &config
 }
 
 type DangerousConfig struct {
-	NoL1Listener bool `koanf:"no-l1-listener"`
+	NoL1Listener           bool `koanf:"no-l1-listener"`
+	NoSequencerCoordinator bool `koanf:"no-sequencer-coordinator"`
+	DisableBlobReader      bool `koanf:"disable-blob-reader"`
 }
 
 var DefaultDangerousConfig = DangerousConfig{
-	NoL1Listener: false,
+	NoL1Listener:           false,
+	NoSequencerCoordinator: false,
+	DisableBlobReader:      false,
+}
+
+var TestDangerousConfig = DangerousConfig{
+	NoL1Listener:           false,
+	NoSequencerCoordinator: false,
+	DisableBlobReader:      true,
 }
 
 func DangerousConfigAddOptions(prefix string, f *flag.FlagSet) {
 	f.Bool(prefix+".no-l1-listener", DefaultDangerousConfig.NoL1Listener, "DANGEROUS! disables listening to L1. To be used in test nodes only")
+	f.Bool(prefix+".no-sequencer-coordinator", DefaultDangerousConfig.NoSequencerCoordinator, "DANGEROUS! allows sequencing without sequencer-coordinator")
+	f.Bool(prefix+".disable-blob-reader", DefaultDangerousConfig.DisableBlobReader, "DANGEROUS! disables the EIP-4844 blob reader, which is necessary to read batches")
 }
 
 type Node struct {
 	ArbDB                   ethdb.Database
 	Stack                   *node.Node
-	Execution               *execution.ExecutionNode
+	Execution               execution.FullExecutionClient
 	L1Reader                *headerreader.HeaderReader
 	TxStreamer              *TransactionStreamer
 	DeployInfo              *chaininfo.RollupAddresses
+	BlobReader              daprovider.BlobReader
 	InboxReader             *InboxReader
 	InboxTracker            *InboxTracker
 	DelayedSequencer        *DelayedSequencer
@@ -480,16 +281,34 @@ type Node struct {
 	MessagePruner           *MessagePruner
 	BlockValidator          *staker.BlockValidator
 	StatelessBlockValidator *staker.StatelessBlockValidator
-	Staker                  *staker.Staker
+	Staker                  *multiprotocolstaker.MultiProtocolStaker
 	BroadcastServer         *broadcaster.Broadcaster
 	BroadcastClients        *broadcastclients.BroadcastClients
 	SeqCoordinator          *SeqCoordinator
 	MaintenanceRunner       *MaintenanceRunner
 	DASLifecycleManager     *das.LifecycleManager
-	ClassicOutboxRetriever  *ClassicOutboxRetriever
 	SyncMonitor             *SyncMonitor
+	blockMetadataFetcher    *BlockMetadataFetcher
 	configFetcher           ConfigFetcher
 	ctx                     context.Context
+}
+
+type SnapSyncConfig struct {
+	Enabled                   bool
+	PrevBatchMessageCount     uint64
+	PrevDelayedRead           uint64
+	BatchCount                uint64
+	DelayedCount              uint64
+	ParentChainAssertionBlock uint64
+}
+
+var DefaultSnapSyncConfig = SnapSyncConfig{
+	Enabled:                   false,
+	PrevBatchMessageCount:     0,
+	PrevDelayedRead:           0,
+	BatchCount:                0,
+	DelayedCount:              0,
+	ParentChainAssertionBlock: 0,
 }
 
 type ConfigFetcher interface {
@@ -539,14 +358,38 @@ func checkArbDbSchemaVersion(arbDb ethdb.Database) error {
 	return nil
 }
 
-func StakerDataposter(
-	db ethdb.Database, l1Reader *headerreader.HeaderReader,
-	transactOpts *bind.TransactOpts, cfgFetcher ConfigFetcher, syncMonitor *SyncMonitor,
+func DataposterOnlyUsedToCreateValidatorWalletContract(
+	ctx context.Context,
+	l1Reader *headerreader.HeaderReader,
+	transactOpts *bind.TransactOpts,
+	cfg *dataposter.DataPosterConfig,
+	parentChainID *big.Int,
 ) (*dataposter.DataPoster, error) {
-	if transactOpts == nil {
+	cfg.UseNoOpStorage = true
+	return dataposter.NewDataPoster(ctx,
+		&dataposter.DataPosterOpts{
+			HeaderReader: l1Reader,
+			Auth:         transactOpts,
+			Config: func() *dataposter.DataPosterConfig {
+				return cfg
+			},
+			MetadataRetriever: func(ctx context.Context, blockNum *big.Int) ([]byte, error) {
+				return nil, nil
+			},
+			ParentChainID: parentChainID,
+		},
+	)
+}
+
+func StakerDataposter(
+	ctx context.Context, db ethdb.Database, l1Reader *headerreader.HeaderReader,
+	transactOpts *bind.TransactOpts, cfgFetcher ConfigFetcher, syncMonitor *SyncMonitor,
+	parentChainID *big.Int,
+) (*dataposter.DataPoster, error) {
+	cfg := cfgFetcher.Get()
+	if transactOpts == nil && cfg.Staker.DataPoster.ExternalSigner.URL == "" {
 		return nil, nil
 	}
-	cfg := cfgFetcher.Get()
 	mdRetriever := func(ctx context.Context, blockNum *big.Int) ([]byte, error) {
 		return nil, nil
 	}
@@ -554,32 +397,43 @@ func StakerDataposter(
 	if err != nil {
 		return nil, fmt.Errorf("creating redis client from url: %w", err)
 	}
-	lockCfgFetcher := func() *redislock.SimpleCfg {
-		return &cfg.Staker.RedisLock
-	}
-	redisLock, err := redislock.NewSimple(redisC, lockCfgFetcher, func() bool { return syncMonitor.Synced() })
-	if err != nil {
-		return nil, err
-	}
 	dpCfg := func() *dataposter.DataPosterConfig {
 		return &cfg.Staker.DataPoster
 	}
-	return dataposter.NewDataPoster(db, l1Reader, transactOpts, redisC, redisLock, dpCfg, mdRetriever)
+	var sender string
+	if transactOpts != nil {
+		sender = transactOpts.From.String()
+	} else {
+		sender = cfg.Staker.DataPoster.ExternalSigner.Address
+	}
+	return dataposter.NewDataPoster(ctx,
+		&dataposter.DataPosterOpts{
+			Database:          db,
+			HeaderReader:      l1Reader,
+			Auth:              transactOpts,
+			RedisClient:       redisC,
+			Config:            dpCfg,
+			MetadataRetriever: mdRetriever,
+			RedisKey:          sender + ".staker-data-poster.queue",
+			ParentChainID:     parentChainID,
+		})
 }
 
 func createNodeImpl(
 	ctx context.Context,
 	stack *node.Node,
-	chainDb ethdb.Database,
+	exec execution.FullExecutionClient,
 	arbDb ethdb.Database,
 	configFetcher ConfigFetcher,
-	l2BlockChain *core.BlockChain,
-	l1client arbutil.L1Interface,
+	l2Config *params.ChainConfig,
+	l1client *ethclient.Client,
 	deployInfo *chaininfo.RollupAddresses,
 	txOptsValidator *bind.TransactOpts,
 	txOptsBatchPoster *bind.TransactOpts,
 	dataSigner signature.DataSignerFunc,
 	fatalErrChan chan error,
+	parentChainID *big.Int,
+	blobReader daprovider.BlobReader,
 ) (*Node, error) {
 	config := configFetcher.Get()
 
@@ -588,20 +442,12 @@ func createNodeImpl(
 		return nil, err
 	}
 
-	l2Config := l2BlockChain.Config()
 	l2ChainId := l2Config.ChainID.Uint64()
 
-	syncMonitor := NewSyncMonitor(&config.SyncMonitor)
-	var classicOutbox *ClassicOutboxRetriever
-	classicMsgDb, err := stack.OpenDatabase("classic-msg", 0, 0, "", true)
-	if err != nil {
-		if l2Config.ArbitrumChainParams.GenesisBlockNum > 0 {
-			log.Warn("Classic Msg Database not found", "err", err)
-		}
-		classicOutbox = nil
-	} else {
-		classicOutbox = NewClassicOutboxRetriever(classicMsgDb)
+	syncConfigFetcher := func() *SyncMonitorConfig {
+		return &configFetcher.Get().SyncMonitor
 	}
+	syncMonitor := NewSyncMonitor(syncConfigFetcher)
 
 	var l1Reader *headerreader.HeaderReader
 	if config.ParentChainReader.Enable {
@@ -610,15 +456,6 @@ func createNodeImpl(
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	sequencerConfigFetcher := func() *execution.SequencerConfig { return &configFetcher.Get().Sequencer }
-	txprecheckConfigFetcher := func() *execution.TxPreCheckerConfig { return &configFetcher.Get().TxPreChecker }
-	exec, err := execution.CreateExecutionNode(stack, chainDb, l2BlockChain, l1Reader, syncMonitor,
-		config.ForwardingTargetF(), &config.Forwarder, config.RPC, &config.RecordingDatabase,
-		sequencerConfigFetcher, txprecheckConfigFetcher)
-	if err != nil {
-		return nil, err
 	}
 
 	var broadcastServer *broadcaster.Broadcaster
@@ -634,12 +471,12 @@ func createNodeImpl(
 	}
 
 	transactionStreamerConfigFetcher := func() *TransactionStreamerConfig { return &configFetcher.Get().TransactionStreamer }
-	txStreamer, err := NewTransactionStreamer(arbDb, l2Config, exec.ExecEngine, broadcastServer, fatalErrChan, transactionStreamerConfigFetcher)
+	txStreamer, err := NewTransactionStreamer(arbDb, l2Config, exec, broadcastServer, fatalErrChan, transactionStreamerConfigFetcher, &configFetcher.Get().SnapSyncTest)
 	if err != nil {
 		return nil, err
 	}
 	var coordinator *SeqCoordinator
-	var bpVerifier *contracts.BatchPosterVerifier
+	var bpVerifier *contracts.AddressVerifier
 	if deployInfo != nil && l1client != nil {
 		sequencerInboxAddr := deployInfo.SequencerInbox
 
@@ -647,19 +484,19 @@ func createNodeImpl(
 		if err != nil {
 			return nil, err
 		}
-		bpVerifier = contracts.NewBatchPosterVerifier(seqInboxCaller)
+		bpVerifier = contracts.NewAddressVerifier(seqInboxCaller)
 	}
 
 	if config.SeqCoordinator.Enable {
-		coordinator, err = NewSeqCoordinator(dataSigner, bpVerifier, txStreamer, exec.Sequencer, syncMonitor, config.SeqCoordinator)
+		coordinator, err = NewSeqCoordinator(dataSigner, bpVerifier, txStreamer, exec, syncMonitor, config.SeqCoordinator)
 		if err != nil {
 			return nil, err
 		}
-	} else if config.Sequencer.Enable && !config.Sequencer.Dangerous.NoCoordinator {
-		return nil, errors.New("sequencer must be enabled with coordinator, unless dangerous.no-coordinator set")
+	} else if config.Sequencer && !config.Dangerous.NoSequencerCoordinator {
+		return nil, errors.New("sequencer must be enabled with coordinator, unless dangerous.no-sequencer-coordinator set")
 	}
-	dbs := []ethdb.Database{chainDb, arbDb}
-	maintenanceRunner, err := NewMaintenanceRunner(func() *MaintenanceConfig { return &configFetcher.Get().Maintenance }, coordinator, dbs)
+	dbs := []ethdb.Database{arbDb}
+	maintenanceRunner, err := NewMaintenanceRunner(func() *MaintenanceConfig { return &configFetcher.Get().Maintenance }, coordinator, dbs, exec)
 	if err != nil {
 		return nil, err
 	}
@@ -685,6 +522,14 @@ func createNodeImpl(
 		}
 	}
 
+	var blockMetadataFetcher *BlockMetadataFetcher
+	if config.BlockMetadataFetcher.Enable {
+		blockMetadataFetcher, err = NewBlockMetadataFetcher(ctx, config.BlockMetadataFetcher, arbDb, exec, config.TransactionStreamer.TrackBlockMetadataFrom)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if !config.ParentChainReader.Enable {
 		return &Node{
 			ArbDB:                   arbDb,
@@ -693,6 +538,7 @@ func createNodeImpl(
 			L1Reader:                nil,
 			TxStreamer:              txStreamer,
 			DeployInfo:              nil,
+			BlobReader:              blobReader,
 			InboxReader:             nil,
 			InboxTracker:            nil,
 			DelayedSequencer:        nil,
@@ -706,8 +552,8 @@ func createNodeImpl(
 			SeqCoordinator:          coordinator,
 			MaintenanceRunner:       maintenanceRunner,
 			DASLifecycleManager:     nil,
-			ClassicOutboxRetriever:  classicOutbox,
 			SyncMonitor:             syncMonitor,
+			blockMetadataFetcher:    blockMetadataFetcher,
 			configFetcher:           configFetcher,
 			ctx:                     ctx,
 		}, nil
@@ -720,6 +566,7 @@ func createNodeImpl(
 	if err != nil {
 		return nil, err
 	}
+	// #nosec G115
 	sequencerInbox, err := NewSequencerInbox(l1client, deployInfo.SequencerInbox, int64(deployInfo.DeployedAt))
 	if err != nil {
 		return nil, err
@@ -728,14 +575,15 @@ func createNodeImpl(
 	var daWriter das.DataAvailabilityServiceWriter
 	var daReader das.DataAvailabilityServiceReader
 	var dasLifecycleManager *das.LifecycleManager
+	var dasKeysetFetcher *das.KeysetFetcher
 	if config.DataAvailability.Enable {
 		if config.BatchPoster.Enable {
-			daWriter, daReader, dasLifecycleManager, err = das.CreateBatchPosterDAS(ctx, &config.DataAvailability, dataSigner, l1client, deployInfo.SequencerInbox)
+			daWriter, daReader, dasKeysetFetcher, dasLifecycleManager, err = das.CreateBatchPosterDAS(ctx, &config.DataAvailability, dataSigner, l1client, deployInfo.SequencerInbox)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			daReader, dasLifecycleManager, err = das.CreateDAReaderForNode(ctx, &config.DataAvailability, l1Reader, &deployInfo.SequencerInbox)
+			daReader, dasKeysetFetcher, dasLifecycleManager, err = das.CreateDAReaderForNode(ctx, &config.DataAvailability, l1Reader, &deployInfo.SequencerInbox)
 			if err != nil {
 				return nil, err
 			}
@@ -749,29 +597,62 @@ func createNodeImpl(
 			}
 			daReader = das.NewReaderPanicWrapper(daReader)
 		}
-	} else if l2BlockChain.Config().ArbitrumChainParams.DataAvailabilityCommittee {
+	} else if l2Config.ArbitrumChainParams.DataAvailabilityCommittee {
 		return nil, errors.New("a data availability service is required for this chain, but it was not configured")
 	}
 
-	inboxTracker, err := NewInboxTracker(arbDb, txStreamer, daReader)
+	// We support a nil txStreamer for the pruning code
+	if txStreamer != nil && txStreamer.chainConfig.ArbitrumChainParams.DataAvailabilityCommittee && daReader == nil {
+		return nil, errors.New("data availability service required but unconfigured")
+	}
+	var dapReaders []daprovider.Reader
+	if daReader != nil {
+		dapReaders = append(dapReaders, daprovider.NewReaderForDAS(daReader, dasKeysetFetcher))
+	}
+	if blobReader != nil {
+		dapReaders = append(dapReaders, daprovider.NewReaderForBlobReader(blobReader))
+	}
+	inboxTracker, err := NewInboxTracker(arbDb, txStreamer, dapReaders, config.SnapSyncTest)
 	if err != nil {
 		return nil, err
 	}
-	inboxReader, err := NewInboxReader(inboxTracker, l1client, l1Reader, new(big.Int).SetUint64(deployInfo.DeployedAt), delayedBridge, sequencerInbox, func() *InboxReaderConfig { return &configFetcher.Get().InboxReader })
+	firstMessageBlock := new(big.Int).SetUint64(deployInfo.DeployedAt)
+	if config.SnapSyncTest.Enabled {
+		batchCount := config.SnapSyncTest.BatchCount
+		delayedMessageNumber, err := exec.NextDelayedMessageNumber()
+		if err != nil {
+			return nil, err
+		}
+		if batchCount > delayedMessageNumber {
+			batchCount = delayedMessageNumber
+		}
+		// Find the first block containing the batch count.
+		// Subtract 1 to get the block before the needed batch count,
+		// this is done to fetch previous batch metadata needed for snap sync.
+		if batchCount > 0 {
+			batchCount--
+		}
+		block, err := FindBlockContainingBatchCount(ctx, deployInfo.Bridge, l1client, config.SnapSyncTest.ParentChainAssertionBlock, batchCount)
+		if err != nil {
+			return nil, err
+		}
+		firstMessageBlock.SetUint64(block)
+	}
+	inboxReader, err := NewInboxReader(inboxTracker, l1client, l1Reader, firstMessageBlock, delayedBridge, sequencerInbox, func() *InboxReaderConfig { return &configFetcher.Get().InboxReader })
 	if err != nil {
 		return nil, err
 	}
 	txStreamer.SetInboxReaders(inboxReader, delayedBridge)
 
 	var statelessBlockValidator *staker.StatelessBlockValidator
-	if config.BlockValidator.ValidationServer.URL != "" {
+	if config.BlockValidator.RedisValidationClientConfig.Enabled() || config.BlockValidator.ValidationServerConfigs[0].URL != "" {
 		statelessBlockValidator, err = staker.NewStatelessBlockValidator(
 			inboxReader,
 			inboxTracker,
 			txStreamer,
-			exec.Recorder,
+			exec,
 			rawdb.NewTable(arbDb, storage.BlockValidatorPrefix),
-			daReader,
+			dapReaders,
 			func() *staker.BlockValidatorConfig { return &configFetcher.Get().BlockValidator },
 			stack,
 		)
@@ -800,86 +681,108 @@ func createNodeImpl(
 		}
 	}
 
-	var stakerObj *staker.Staker
+	var stakerObj *multiprotocolstaker.MultiProtocolStaker
 	var messagePruner *MessagePruner
+	var stakerAddr common.Address
 
 	if config.Staker.Enable {
 		dp, err := StakerDataposter(
+			ctx,
 			rawdb.NewTable(arbDb, storage.StakerPrefix),
 			l1Reader,
 			txOptsValidator,
 			configFetcher,
 			syncMonitor,
+			parentChainID,
 		)
 		if err != nil {
 			return nil, err
 		}
 		getExtraGas := func() uint64 { return configFetcher.Get().Staker.ExtraGas }
-		var wallet staker.ValidatorWalletInterface
-		if config.Staker.UseSmartContractWallet || txOptsValidator == nil {
-			var existingWalletAddress *common.Address
-			if len(config.Staker.ContractWalletAddress) > 0 {
-				if !common.IsHexAddress(config.Staker.ContractWalletAddress) {
-					log.Error("invalid validator smart contract wallet", "addr", config.Staker.ContractWalletAddress)
-					return nil, errors.New("invalid validator smart contract wallet address")
+		// TODO: factor this out into separate helper, and split rest of node
+		// creation into multiple helpers.
+		var wallet legacystaker.ValidatorWalletInterface = validatorwallet.NewNoOp(l1client, deployInfo.Rollup)
+		if !strings.EqualFold(config.Staker.Strategy, "watchtower") {
+			if config.Staker.UseSmartContractWallet || (txOptsValidator == nil && config.Staker.DataPoster.ExternalSigner.URL == "") {
+				var existingWalletAddress *common.Address
+				if len(config.Staker.ContractWalletAddress) > 0 {
+					if !common.IsHexAddress(config.Staker.ContractWalletAddress) {
+						log.Error("invalid validator smart contract wallet", "addr", config.Staker.ContractWalletAddress)
+						return nil, errors.New("invalid validator smart contract wallet address")
+					}
+					tmpAddress := common.HexToAddress(config.Staker.ContractWalletAddress)
+					existingWalletAddress = &tmpAddress
 				}
-				tmpAddress := common.HexToAddress(config.Staker.ContractWalletAddress)
-				existingWalletAddress = &tmpAddress
-			}
-			wallet, err = staker.NewContractValidatorWallet(dp, existingWalletAddress, deployInfo.ValidatorWalletCreator, deployInfo.Rollup, l1Reader, txOptsValidator, int64(deployInfo.DeployedAt), func(common.Address) {}, getExtraGas)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			if len(config.Staker.ContractWalletAddress) > 0 {
-				return nil, errors.New("validator contract wallet specified but flag to use a smart contract wallet was not specified")
-			}
-			wallet, err = staker.NewEoaValidatorWallet(dp, deployInfo.Rollup, l1client, txOptsValidator, getExtraGas)
-			if err != nil {
-				return nil, err
+				// #nosec G115
+				wallet, err = validatorwallet.NewContract(dp, existingWalletAddress, deployInfo.ValidatorWalletCreator, deployInfo.Rollup, l1Reader, txOptsValidator, int64(deployInfo.DeployedAt), func(common.Address) {}, getExtraGas)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				if len(config.Staker.ContractWalletAddress) > 0 {
+					return nil, errors.New("validator contract wallet specified but flag to use a smart contract wallet was not specified")
+				}
+				wallet, err = validatorwallet.NewEOA(dp, deployInfo.Rollup, l1client, getExtraGas)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 
-		var confirmedNotifiers []staker.LatestConfirmedNotifier
-		if config.MessagePruner.Enable && !config.Caching.Archive {
+		var confirmedNotifiers []legacystaker.LatestConfirmedNotifier
+		if config.MessagePruner.Enable {
 			messagePruner = NewMessagePruner(txStreamer, inboxTracker, func() *MessagePrunerConfig { return &configFetcher.Get().MessagePruner })
 			confirmedNotifiers = append(confirmedNotifiers, messagePruner)
 		}
 
-		stakerObj, err = staker.NewStaker(l1Reader, wallet, bind.CallOpts{}, config.Staker, blockValidator, statelessBlockValidator, nil, confirmedNotifiers, deployInfo.ValidatorUtils, fatalErrChan)
+		stakerObj, err = multiprotocolstaker.NewMultiProtocolStaker(stack, l1Reader, wallet, bind.CallOpts{}, func() *legacystaker.L1ValidatorConfig { return &configFetcher.Get().Staker }, &configFetcher.Get().Bold, blockValidator, statelessBlockValidator, nil, deployInfo.StakeToken, confirmedNotifiers, deployInfo.ValidatorUtils, deployInfo.Bridge, fatalErrChan)
 		if err != nil {
 			return nil, err
 		}
-		if stakerObj.Strategy() != staker.WatchtowerStrategy {
-			err := wallet.Initialize(ctx)
-			if err != nil {
-				return nil, err
-			}
-		}
-		var txValidatorSenderPtr *common.Address
-		if txOptsValidator != nil {
-			txValidatorSenderPtr = &txOptsValidator.From
-		}
-		whitelisted, err := stakerObj.IsWhitelisted(ctx)
-		if err != nil {
+		if err := wallet.Initialize(ctx); err != nil {
 			return nil, err
 		}
-		log.Info("running as validator", "txSender", txValidatorSenderPtr, "actingAsWallet", wallet.Address(), "whitelisted", whitelisted, "strategy", config.Staker.Strategy)
+		if dp != nil {
+			stakerAddr = dp.Sender()
+		}
 	}
 
 	var batchPoster *BatchPoster
 	var delayedSequencer *DelayedSequencer
 	if config.BatchPoster.Enable {
-		if txOptsBatchPoster == nil {
+		if txOptsBatchPoster == nil && config.BatchPoster.DataPoster.ExternalSigner.URL == "" {
 			return nil, errors.New("batchposter, but no TxOpts")
 		}
-		batchPoster, err = NewBatchPoster(rawdb.NewTable(arbDb, storage.BatchPosterPrefix), l1Reader, inboxTracker, txStreamer, syncMonitor, func() *BatchPosterConfig { return &configFetcher.Get().BatchPoster }, deployInfo, txOptsBatchPoster, daWriter)
+		var dapWriter daprovider.Writer
+		if daWriter != nil {
+			dapWriter = daprovider.NewWriterForDAS(daWriter)
+		}
+		batchPoster, err = NewBatchPoster(ctx, &BatchPosterOpts{
+			DataPosterDB:  rawdb.NewTable(arbDb, storage.BatchPosterPrefix),
+			L1Reader:      l1Reader,
+			Inbox:         inboxTracker,
+			Streamer:      txStreamer,
+			VersionGetter: exec,
+			SyncMonitor:   syncMonitor,
+			Config:        func() *BatchPosterConfig { return &configFetcher.Get().BatchPoster },
+			DeployInfo:    deployInfo,
+			TransactOpts:  txOptsBatchPoster,
+			DAPWriter:     dapWriter,
+			ParentChainID: parentChainID,
+			DAPReaders:    dapReaders,
+		})
 		if err != nil {
 			return nil, err
 		}
+
+		// Check if staker and batch poster are using the same address
+		if stakerAddr != (common.Address{}) && !strings.EqualFold(config.Staker.Strategy, "watchtower") && stakerAddr == batchPoster.dataPoster.Sender() {
+			return nil, fmt.Errorf("staker and batch poster are using the same address which is not allowed: %v", stakerAddr)
+		}
 	}
+
 	// always create DelayedSequencer, it won't do anything if it is disabled
-	delayedSequencer, err = NewDelayedSequencer(l1Reader, inboxReader, exec.ExecEngine, coordinator, func() *DelayedSequencerConfig { return &configFetcher.Get().DelayedSequencer })
+	delayedSequencer, err = NewDelayedSequencer(l1Reader, inboxReader, exec, coordinator, func() *DelayedSequencerConfig { return &configFetcher.Get().DelayedSequencer })
 	if err != nil {
 		return nil, err
 	}
@@ -891,6 +794,7 @@ func createNodeImpl(
 		L1Reader:                l1Reader,
 		TxStreamer:              txStreamer,
 		DeployInfo:              deployInfo,
+		BlobReader:              blobReader,
 		InboxReader:             inboxReader,
 		InboxTracker:            inboxTracker,
 		DelayedSequencer:        delayedSequencer,
@@ -904,11 +808,58 @@ func createNodeImpl(
 		SeqCoordinator:          coordinator,
 		MaintenanceRunner:       maintenanceRunner,
 		DASLifecycleManager:     dasLifecycleManager,
-		ClassicOutboxRetriever:  classicOutbox,
 		SyncMonitor:             syncMonitor,
+		blockMetadataFetcher:    blockMetadataFetcher,
 		configFetcher:           configFetcher,
 		ctx:                     ctx,
 	}, nil
+}
+
+func FindBlockContainingBatchCount(ctx context.Context, bridgeAddress common.Address, l1Client *ethclient.Client, parentChainAssertionBlock uint64, batchCount uint64) (uint64, error) {
+	bridge, err := bridgegen.NewIBridge(bridgeAddress, l1Client)
+	if err != nil {
+		return 0, err
+	}
+	high := parentChainAssertionBlock
+	low := uint64(0)
+	reduceBy := uint64(100)
+	if high > reduceBy {
+		low = high - reduceBy
+	}
+	// Reduce high and low by 100 until lowNode.InboxMaxCount < batchCount
+	// This will give us a range (low to high) of blocks that contain the batch count.
+	for low > 0 {
+		lowCount, err := bridge.SequencerMessageCount(&bind.CallOpts{Context: ctx, BlockNumber: new(big.Int).SetUint64(low)})
+		if err != nil {
+			return 0, err
+		}
+		if lowCount.Uint64() > batchCount {
+			high = low
+			reduceBy = reduceBy * 2
+			if low > reduceBy {
+				low = low - reduceBy
+			} else {
+				low = 0
+			}
+		} else {
+			break
+		}
+	}
+	// Then binary search between low and high to find the block containing the batch count.
+	for low < high {
+		mid := low + (high-low)/2
+
+		midCount, err := bridge.SequencerMessageCount(&bind.CallOpts{Context: ctx, BlockNumber: new(big.Int).SetUint64(mid)})
+		if err != nil {
+			return 0, err
+		}
+		if midCount.Uint64() < batchCount {
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	return low, nil
 }
 
 func (n *Node) OnConfigReload(_ *Config, _ *Config) error {
@@ -919,18 +870,20 @@ func (n *Node) OnConfigReload(_ *Config, _ *Config) error {
 func CreateNode(
 	ctx context.Context,
 	stack *node.Node,
-	chainDb ethdb.Database,
+	exec execution.FullExecutionClient,
 	arbDb ethdb.Database,
 	configFetcher ConfigFetcher,
-	l2BlockChain *core.BlockChain,
-	l1client arbutil.L1Interface,
+	l2Config *params.ChainConfig,
+	l1client *ethclient.Client,
 	deployInfo *chaininfo.RollupAddresses,
 	txOptsValidator *bind.TransactOpts,
 	txOptsBatchPoster *bind.TransactOpts,
 	dataSigner signature.DataSignerFunc,
 	fatalErrChan chan error,
+	parentChainID *big.Int,
+	blobReader daprovider.BlobReader,
 ) (*Node, error) {
-	currentNode, err := createNodeImpl(ctx, stack, chainDb, arbDb, configFetcher, l2BlockChain, l1client, deployInfo, txOptsValidator, txOptsBatchPoster, dataSigner, fatalErrChan)
+	currentNode, err := createNodeImpl(ctx, stack, exec, arbDb, configFetcher, l2Config, l1client, deployInfo, txOptsValidator, txOptsBatchPoster, dataSigner, fatalErrChan, parentChainID, blobReader)
 	if err != nil {
 		return nil, err
 	}
@@ -945,68 +898,57 @@ func CreateNode(
 	}
 	if currentNode.StatelessBlockValidator != nil {
 		apis = append(apis, rpc.API{
-			Namespace: "arbvalidator",
+			Namespace: "arbdebug",
 			Version:   "1.0",
 			Service: &BlockValidatorDebugAPI{
-				val:        currentNode.StatelessBlockValidator,
-				blockchain: l2BlockChain,
+				val: currentNode.StatelessBlockValidator,
 			},
 			Public: false,
 		})
 	}
-
-	apis = append(apis, rpc.API{
-		Namespace: "arb",
-		Version:   "1.0",
-		Service:   execution.NewArbAPI(currentNode.Execution.TxPublisher),
-		Public:    false,
-	})
-	config := configFetcher.Get()
-	apis = append(apis, rpc.API{
-		Namespace: "arbdebug",
-		Version:   "1.0",
-		Service: execution.NewArbDebugAPI(
-			l2BlockChain,
-			config.RPC.ArbDebug.BlockRangeBound,
-			config.RPC.ArbDebug.TimeoutQueueBound,
-		),
-		Public: false,
-	})
-	apis = append(apis, rpc.API{
-		Namespace: "arbtrace",
-		Version:   "1.0",
-		Service: execution.NewArbTraceForwarderAPI(
-			config.RPC.ClassicRedirect,
-			config.RPC.ClassicRedirectTimeout,
-		),
-		Public: false,
-	})
-	apis = append(apis, rpc.API{
-		Namespace: "debug",
-		Service:   eth.NewDebugAPI(eth.NewArbEthereum(l2BlockChain, chainDb)),
-		Public:    false,
-	})
+	if currentNode.MaintenanceRunner != nil {
+		apis = append(apis, rpc.API{
+			Namespace: "maintenance",
+			Version:   "1.0",
+			Service: &MaintenanceAPI{
+				runner: currentNode.MaintenanceRunner,
+			},
+			Public: false,
+		})
+	}
 	stack.RegisterAPIs(apis)
 
 	return currentNode, nil
 }
 
 func (n *Node) Start(ctx context.Context) error {
-	// config is the static config at start, not a dynamic config
-	config := n.configFetcher.Get()
+	execClient, ok := n.Execution.(*gethexec.ExecutionNode)
+	if !ok {
+		execClient = nil
+	}
+	if execClient != nil {
+		err := execClient.Initialize(ctx)
+		if err != nil {
+			return fmt.Errorf("error initializing exec client: %w", err)
+		}
+	}
 	n.SyncMonitor.Initialize(n.InboxReader, n.TxStreamer, n.SeqCoordinator)
-	n.Execution.ArbInterface.Initialize(n)
 	err := n.Stack.Start()
 	if err != nil {
 		return fmt.Errorf("error starting geth stack: %w", err)
 	}
-	err = n.Execution.Backend.Start()
-	if err != nil {
-		return fmt.Errorf("error starting geth backend: %w", err)
+	if execClient != nil {
+		execClient.SetConsensusClient(n)
 	}
-	err = n.Execution.TxPublisher.Initialize(ctx)
+	err = n.Execution.Start(ctx)
 	if err != nil {
-		return fmt.Errorf("error initializing transaction publisher: %w", err)
+		return fmt.Errorf("error starting exec client: %w", err)
+	}
+	if n.BlobReader != nil {
+		err = n.BlobReader.Initialize(ctx)
+		if err != nil {
+			return fmt.Errorf("error initializing blob reader: %w", err)
+		}
 	}
 	if n.InboxTracker != nil {
 		err = n.InboxTracker.Initialize()
@@ -1020,9 +962,9 @@ func (n *Node) Start(ctx context.Context) error {
 			return fmt.Errorf("error initializing feed broadcast server: %w", err)
 		}
 	}
-	if n.InboxTracker != nil && n.BroadcastServer != nil && config.Sequencer.Enable && !config.SeqCoordinator.Enable {
-		// Normally, the sequencer would populate the feed backlog when it acquires the lockout.
-		// However, if the sequencer coordinator is not enabled, we must populate the backlog on startup.
+	if n.InboxTracker != nil && n.BroadcastServer != nil {
+		// Even if the sequencer coordinator will populate this backlog,
+		// we want to make sure it's populated before any clients connect.
 		err = n.InboxTracker.PopulateFeedBacklog(n.BroadcastServer)
 		if err != nil {
 			return fmt.Errorf("error populating feed backlog on startup: %w", err)
@@ -1032,25 +974,23 @@ func (n *Node) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("error starting transaction streamer: %w", err)
 	}
-	n.Execution.ExecEngine.Start(ctx)
 	if n.InboxReader != nil {
 		err = n.InboxReader.Start(ctx)
 		if err != nil {
 			return fmt.Errorf("error starting inbox reader: %w", err)
 		}
 	}
-	if n.DelayedSequencer != nil && n.SeqCoordinator == nil {
-		err = n.DelayedSequencer.ForceSequenceDelayed(ctx)
+	// must init broadcast server before trying to sequence anything
+	if n.BroadcastServer != nil {
+		err = n.BroadcastServer.Start(ctx)
 		if err != nil {
-			return fmt.Errorf("error performing initial delayed sequencing: %w", err)
+			return fmt.Errorf("error starting feed broadcast server: %w", err)
 		}
-	}
-	err = n.Execution.TxPublisher.Start(ctx)
-	if err != nil {
-		return fmt.Errorf("error starting transaction puiblisher: %w", err)
 	}
 	if n.SeqCoordinator != nil {
 		n.SeqCoordinator.Start(ctx)
+	} else {
+		n.Execution.Activate()
 	}
 	if n.MaintenanceRunner != nil {
 		n.MaintenanceRunner.Start(ctx)
@@ -1097,12 +1037,6 @@ func (n *Node) Start(ctx context.Context) error {
 	if n.L1Reader != nil {
 		n.L1Reader.Start(ctx)
 	}
-	if n.BroadcastServer != nil {
-		err = n.BroadcastServer.Start(ctx)
-		if err != nil {
-			return fmt.Errorf("error starting feed broadcast server: %w", err)
-		}
-	}
 	if n.BroadcastClients != nil {
 		go func() {
 			if n.InboxReader != nil {
@@ -1115,9 +1049,13 @@ func (n *Node) Start(ctx context.Context) error {
 			n.BroadcastClients.Start(ctx)
 		}()
 	}
+	if n.blockMetadataFetcher != nil {
+		n.blockMetadataFetcher.Start(ctx)
+	}
 	if n.configFetcher != nil {
 		n.configFetcher.Start(ctx)
 	}
+	n.SyncMonitor.Start(ctx)
 	return nil
 }
 
@@ -1134,9 +1072,6 @@ func (n *Node) StopAndWait() {
 		n.SeqCoordinator.PrepareForShutdown()
 	}
 	n.Stack.StopRPC() // does nothing if not running
-	if n.Execution.TxPublisher.Started() {
-		n.Execution.TxPublisher.StopAndWait()
-	}
 	if n.DelayedSequencer != nil && n.DelayedSequencer.Started() {
 		n.DelayedSequencer.StopAndWait()
 	}
@@ -1161,7 +1096,6 @@ func (n *Node) StopAndWait() {
 	if n.StatelessBlockValidator != nil {
 		n.StatelessBlockValidator.Stop()
 	}
-	n.Execution.Recorder.OrderlyShutdown()
 	if n.InboxReader != nil && n.InboxReader.Started() {
 		n.InboxReader.StopAndWait()
 	}
@@ -1171,21 +1105,66 @@ func (n *Node) StopAndWait() {
 	if n.TxStreamer.Started() {
 		n.TxStreamer.StopAndWait()
 	}
-	if n.Execution.ExecEngine.Started() {
-		n.Execution.ExecEngine.StopAndWait()
-	}
 	if n.SeqCoordinator != nil && n.SeqCoordinator.Started() {
 		// Just stops the redis client (most other stuff was stopped earlier)
 		n.SeqCoordinator.StopAndWait()
 	}
-	n.Execution.ArbInterface.BlockChain().Stop() // does nothing if not running
-	if err := n.Execution.Backend.Stop(); err != nil {
-		log.Error("backend stop", "err", err)
-	}
+	n.SyncMonitor.StopAndWait()
 	if n.DASLifecycleManager != nil {
 		n.DASLifecycleManager.StopAndWaitUntil(2 * time.Second)
 	}
-	if err := n.Stack.Close(); err != nil {
-		log.Error("error on stak close", "err", err)
+	if n.Execution != nil {
+		n.Execution.StopAndWait()
 	}
+	if err := n.Stack.Close(); err != nil {
+		log.Error("error on stack close", "err", err)
+	}
+}
+
+func (n *Node) FindInboxBatchContainingMessage(message arbutil.MessageIndex) (uint64, bool, error) {
+	return n.InboxTracker.FindInboxBatchContainingMessage(message)
+}
+
+func (n *Node) GetBatchParentChainBlock(seqNum uint64) (uint64, error) {
+	return n.InboxTracker.GetBatchParentChainBlock(seqNum)
+}
+
+func (n *Node) FullSyncProgressMap() map[string]interface{} {
+	return n.SyncMonitor.FullSyncProgressMap()
+}
+
+func (n *Node) Synced() bool {
+	return n.SyncMonitor.Synced()
+}
+
+func (n *Node) SyncTargetMessageCount() arbutil.MessageIndex {
+	return n.SyncMonitor.SyncTargetMessageCount()
+}
+
+// TODO: switch from pulling to pushing safe/finalized
+func (n *Node) GetSafeMsgCount(ctx context.Context) (arbutil.MessageIndex, error) {
+	return n.InboxReader.GetSafeMsgCount(ctx)
+}
+
+func (n *Node) GetFinalizedMsgCount(ctx context.Context) (arbutil.MessageIndex, error) {
+	return n.InboxReader.GetFinalizedMsgCount(ctx)
+}
+
+func (n *Node) WriteMessageFromSequencer(pos arbutil.MessageIndex, msgWithMeta arbostypes.MessageWithMetadata, msgResult execution.MessageResult, blockMetadata common.BlockMetadata) error {
+	return n.TxStreamer.WriteMessageFromSequencer(pos, msgWithMeta, msgResult, blockMetadata)
+}
+
+func (n *Node) ExpectChosenSequencer() error {
+	return n.TxStreamer.ExpectChosenSequencer()
+}
+
+func (n *Node) ValidatedMessageCount() (arbutil.MessageIndex, error) {
+	if n.BlockValidator == nil {
+		return 0, errors.New("validator not set up")
+	}
+	return n.BlockValidator.GetValidated(), nil
+}
+
+func (n *Node) BlockMetadataAtCount(count arbutil.MessageIndex) (common.BlockMetadata, error) {
+	return n.TxStreamer.BlockMetadataAtCount(count)
 }

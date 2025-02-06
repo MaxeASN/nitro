@@ -44,7 +44,7 @@ type messageCountPredicate struct {
 }
 
 func (p *messageCountPredicate) Test() bool {
-	p.was = p.b.catchupBuffer.GetMessageCount()
+	p.was = p.b.GetCachedMessageCount()
 	return p.was == p.expected
 }
 
@@ -70,34 +70,38 @@ func TestBroadcasterMessagesRemovedOnConfirmation(t *testing.T) {
 	}
 
 	// Normal broadcasting and confirming
-	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 1))
+	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 1, nil, nil))
 	waitUntilUpdated(t, expectMessageCount(1, "after 1 message"))
-	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 2))
+	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 2, nil, nil))
 	waitUntilUpdated(t, expectMessageCount(2, "after 2 messages"))
-	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 3))
+	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 3, nil, nil))
 	waitUntilUpdated(t, expectMessageCount(3, "after 3 messages"))
-	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 4))
+	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 4, nil, nil))
 	waitUntilUpdated(t, expectMessageCount(4, "after 4 messages"))
+	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 5, nil, nil))
+	waitUntilUpdated(t, expectMessageCount(5, "after 4 messages"))
+	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 6, nil, nil))
+	waitUntilUpdated(t, expectMessageCount(6, "after 4 messages"))
 
-	b.Confirm(1)
-	waitUntilUpdated(t, expectMessageCount(3,
-		"after 4 messages, 1 cleared by confirm"))
-
-	b.Confirm(2)
+	b.Confirm(4)
 	waitUntilUpdated(t, expectMessageCount(2,
-		"after 4 messages, 2 cleared by confirm"))
+		"after 6 messages, 4 cleared by confirm"))
 
-	b.Confirm(1)
-	waitUntilUpdated(t, expectMessageCount(2,
+	b.Confirm(5)
+	waitUntilUpdated(t, expectMessageCount(1,
+		"after 6 messages, 5 cleared by confirm"))
+
+	b.Confirm(4)
+	waitUntilUpdated(t, expectMessageCount(1,
 		"nothing changed because confirmed sequence number before cache"))
 
-	b.Confirm(2)
-	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 5))
-	waitUntilUpdated(t, expectMessageCount(3,
-		"after 5 messages, 2 cleared by confirm"))
+	b.Confirm(5)
+	Require(t, b.BroadcastSingle(arbostypes.EmptyTestMessageWithMetadata, 7, nil, nil))
+	waitUntilUpdated(t, expectMessageCount(2,
+		"after 7 messages, 5 cleared by confirm"))
 
 	// Confirm not-yet-seen or already confirmed/cleared sequence numbers twice to force clearing cache
-	b.Confirm(6)
+	b.Confirm(8)
 	waitUntilUpdated(t, expectMessageCount(0,
 		"clear all messages after confirmed 1 beyond latest"))
 }

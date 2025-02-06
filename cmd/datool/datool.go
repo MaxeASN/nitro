@@ -22,10 +22,10 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/offchainlabs/nitro/arbstate"
+
+	"github.com/offchainlabs/nitro/arbstate/daprovider"
 	"github.com/offchainlabs/nitro/cmd/genericconf"
 	"github.com/offchainlabs/nitro/cmd/util"
-
 	"github.com/offchainlabs/nitro/cmd/util/confighelpers"
 	"github.com/offchainlabs/nitro/das"
 	"github.com/offchainlabs/nitro/das/dastree"
@@ -91,6 +91,8 @@ type ClientStoreConfig struct {
 	SigningKey            string        `koanf:"signing-key"`
 	SigningWallet         string        `koanf:"signing-wallet"`
 	SigningWalletPassword string        `koanf:"signing-wallet-password"`
+	MaxStoreChunkBodySize int           `koanf:"max-store-chunk-body-size"`
+	EnableChunkedStore    bool          `koanf:"enable-chunked-store"`
 }
 
 func parseClientStoreConfig(args []string) (*ClientStoreConfig, error) {
@@ -98,11 +100,12 @@ func parseClientStoreConfig(args []string) (*ClientStoreConfig, error) {
 	f.String("url", "", "URL of DAS server to connect to")
 	f.String("message", "", "message to send")
 	f.Int("random-message-size", 0, "send a message of a specified number of random bytes")
-	f.String("signing-key", "", "ecdsa private key to sign the message with, treated as a hex string if prefixed with 0x otherise treated as a file; if not specified the message is not signed")
+	f.String("signing-key", "", "ecdsa private key to sign the message with, treated as a hex string if prefixed with 0x otherwise treated as a file; if not specified the message is not signed")
 	f.String("signing-wallet", "", "wallet containing ecdsa key to sign the message with")
 	f.String("signing-wallet-password", genericconf.PASSWORD_NOT_SET, "password to unlock the wallet, if not specified the user is prompted for the password")
 	f.Duration("das-retention-period", 24*time.Hour, "The period which DASes are requested to retain the stored batches.")
-	genericconf.ConfConfigAddOptions("conf", f)
+	f.Int("max-store-chunk-body-size", 512*1024, "The maximum HTTP POST body size for a chunked store request")
+	f.Bool("enable-chunked-store", true, "enable data to be sent to DAS in chunks instead of all at once")
 
 	k, err := confighelpers.BeginCommonParse(f, args)
 	if err != nil {
@@ -122,12 +125,7 @@ func startClientStore(args []string) error {
 		return err
 	}
 
-	client, err := das.NewDASRPCClient(config.URL)
-	if err != nil {
-		return err
-	}
-
-	var dasClient das.DataAvailabilityServiceWriter = client
+	var signer signature.DataSignerFunc
 	if config.SigningKey != "" {
 		var privateKey *ecdsa.PrivateKey
 		if config.SigningKey[:2] == "0x" {
@@ -141,12 +139,7 @@ func startClientStore(args []string) error {
 				return err
 			}
 		}
-		signer := signature.DataSignerFromPrivateKey(privateKey)
-
-		dasClient, err = das.NewStoreSigningDAS(dasClient, signer)
-		if err != nil {
-			return err
-		}
+		signer = signature.DataSignerFromPrivateKey(privateKey)
 	} else if config.SigningWallet != "" {
 		walletConf := &genericconf.WalletConfig{
 			Pathname:      config.SigningWallet,
@@ -155,18 +148,19 @@ func startClientStore(args []string) error {
 			Account:       "",
 			OnlyCreateKey: false,
 		}
-		_, signer, err := util.OpenWallet("datool", walletConf, nil)
-		if err != nil {
-			return err
-		}
-		dasClient, err = das.NewStoreSigningDAS(dasClient, signer)
+		_, signer, err = util.OpenWallet("datool", walletConf, nil)
 		if err != nil {
 			return err
 		}
 	}
 
+	client, err := das.NewDASRPCClient(config.URL, signer, config.MaxStoreChunkBodySize, config.EnableChunkedStore)
+	if err != nil {
+		return err
+	}
+
 	ctx := context.Background()
-	var cert *arbstate.DataAvailabilityCertificate
+	var cert *daprovider.DataAvailabilityCertificate
 
 	if config.RandomMessageSize > 0 {
 		message := make([]byte, config.RandomMessageSize)
@@ -174,9 +168,11 @@ func startClientStore(args []string) error {
 		if err != nil {
 			return err
 		}
-		cert, err = dasClient.Store(ctx, message, uint64(time.Now().Add(config.DASRetentionPeriod).Unix()), []byte{})
+		// #nosec G115
+		cert, err = client.Store(ctx, message, uint64(time.Now().Add(config.DASRetentionPeriod).Unix()))
 	} else if len(config.Message) > 0 {
-		cert, err = dasClient.Store(ctx, []byte(config.Message), uint64(time.Now().Add(config.DASRetentionPeriod).Unix()), []byte{})
+		// #nosec G115
+		cert, err = client.Store(ctx, []byte(config.Message), uint64(time.Now().Add(config.DASRetentionPeriod).Unix()))
 	} else {
 		return errors.New("--message or --random-message-size must be specified")
 	}
@@ -185,7 +181,7 @@ func startClientStore(args []string) error {
 		return err
 	}
 
-	serializedCert := das.Serialize(cert)
+	serializedCert := daprovider.Serialize(cert)
 	fmt.Printf("Hex Encoded Cert: %s\n", hexutil.Encode(serializedCert))
 	fmt.Printf("Hex Encoded Data Hash: %s\n", hexutil.Encode(cert.DataHash[:]))
 
@@ -203,8 +199,6 @@ func parseRESTClientGetByHashConfig(args []string) (*RESTClientGetByHashConfig, 
 	f := flag.NewFlagSet("datool client retrieve", flag.ContinueOnError)
 	f.String("url", "http://localhost:9877", "URL of DAS server to connect to.")
 	f.String("data-hash", "", "hash of the message to retrieve, if starts with '0x' it's treated as hex encoded, otherwise base64 encoded")
-
-	genericconf.ConfConfigAddOptions("conf", f)
 
 	k, err := confighelpers.BeginCommonParse(f, args)
 	if err != nil {
@@ -267,7 +261,6 @@ func parseKeyGenConfig(args []string) (*KeyGenConfig, error) {
 	f.String("dir", "", "the directory to generate the keys in")
 	f.Bool("ecdsa", false, "generate an ECDSA keypair instead of BLS")
 	f.Bool("wallet", false, "generate the ECDSA keypair in a wallet file")
-	genericconf.ConfConfigAddOptions("conf", f)
 
 	k, err := confighelpers.BeginCommonParse(f, args)
 	if err != nil {
@@ -327,6 +320,10 @@ func parseDumpKeyset(args []string) (*DumpKeysetConfig, error) {
 		return nil, err
 	}
 
+	if err = das.FixKeysetCLIParsing("keyset.backends", k); err != nil {
+		return nil, err
+	}
+
 	var config DumpKeysetConfig
 	if err := confighelpers.EndCommonParse(k, &config); err != nil {
 		return nil, err
@@ -345,7 +342,7 @@ func parseDumpKeyset(args []string) (*DumpKeysetConfig, error) {
 	if config.Keyset.AssumedHonest == 0 {
 		return nil, errors.New("--keyset.assumed-honest must be set")
 	}
-	if config.Keyset.Backends == "" {
+	if config.Keyset.Backends == nil {
 		return nil, errors.New("--keyset.backends must be set")
 	}
 
@@ -365,11 +362,12 @@ func dumpKeyset(args []string) error {
 		return err
 	}
 
-	services, err := das.ParseServices(config.Keyset)
+	services, err := das.ParseServices(config.Keyset, nil)
 	if err != nil {
 		return err
 	}
 
+	// #nosec G115
 	keysetHash, keysetBytes, err := das.KeysetHashFromServices(services, uint64(config.Keyset.AssumedHonest))
 	if err != nil {
 		return err

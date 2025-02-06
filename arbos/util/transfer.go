@@ -9,13 +9,18 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
+
 	"github.com/offchainlabs/nitro/util/arbmath"
 )
 
-// TransferBalance represents a balance change occuring aside from a call.
+// TransferBalance represents a balance change occurring aside from a call.
 // While most uses will be transfers, setting `from` or `to` to nil will mint or burn funds, respectively.
 func TransferBalance(
 	from, to *common.Address,
@@ -27,42 +32,48 @@ func TransferBalance(
 	if amount.Sign() < 0 {
 		panic(fmt.Sprintf("Tried to transfer negative amount %v from %v to %v", amount, from, to))
 	}
-	if from != nil {
-		balance := evm.StateDB.GetBalance(*from)
-		if arbmath.BigLessThan(balance, amount) {
-			return fmt.Errorf("%w: addr %v have %v want %v", vm.ErrInsufficientBalance, *from, balance, amount)
-		}
-		evm.StateDB.SubBalance(*from, amount)
-	}
-	if to != nil {
-		evm.StateDB.AddBalance(*to, amount)
-	}
 	if tracer := evm.Config.Tracer; tracer != nil {
 		if evm.Depth() != 0 && scenario != TracingDuringEVM {
-			// A non-zero depth implies this transfer is occuring inside EVM execution
+			// A non-zero depth implies this transfer is occurring inside EVM execution
 			log.Error("Tracing scenario mismatch", "scenario", scenario, "depth", evm.Depth())
 			return errors.New("tracing scenario mismatch")
 		}
 
 		if scenario != TracingDuringEVM {
-			tracer.CaptureArbitrumTransfer(evm, from, to, amount, scenario == TracingBeforeEVM, purpose)
-			return nil
-		}
+			if tracer.CaptureArbitrumTransfer != nil {
+				tracer.CaptureArbitrumTransfer(from, to, amount, scenario == TracingBeforeEVM, purpose)
+			}
+		} else {
+			fromCopy := from
+			toCopy := to
+			if fromCopy == nil {
+				fromCopy = &common.Address{}
+			}
+			if toCopy == nil {
+				toCopy = &common.Address{}
+			}
 
-		if from == nil {
-			from = &common.Address{}
+			info := &TracingInfo{
+				Tracer:   evm.Config.Tracer,
+				Scenario: scenario,
+				Contract: vm.NewContract(addressHolder{*toCopy}, addressHolder{*fromCopy}, uint256.NewInt(0), 0),
+				Depth:    evm.Depth(),
+			}
+			info.MockCall([]byte{}, 0, *fromCopy, *toCopy, amount)
 		}
-		if to == nil {
-			to = &common.Address{}
+	}
+	if from != nil {
+		balance := evm.StateDB.GetBalance(*from)
+		if arbmath.BigLessThan(balance.ToBig(), amount) {
+			return fmt.Errorf("%w: addr %v have %v want %v", vm.ErrInsufficientBalance, *from, balance, amount)
 		}
-
-		info := &TracingInfo{
-			Tracer:   evm.Config.Tracer,
-			Scenario: scenario,
-			Contract: vm.NewContract(addressHolder{*to}, addressHolder{*from}, big.NewInt(0), 0),
-			Depth:    evm.Depth(),
+		if evm.Context.ArbOSVersion < params.ArbosVersion_Stylus && amount.Sign() == 0 {
+			evm.StateDB.CreateZombieIfDeleted(*from)
 		}
-		info.MockCall([]byte{}, 0, *from, *to, amount)
+		evm.StateDB.SubBalance(*from, uint256.MustFromBig(amount), tracing.BalanceChangeTransfer)
+	}
+	if to != nil {
+		evm.StateDB.AddBalance(*to, uint256.MustFromBig(amount), tracing.BalanceChangeTransfer)
 	}
 	return nil
 }

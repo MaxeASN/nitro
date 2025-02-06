@@ -13,9 +13,12 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 
+	"github.com/offchainlabs/nitro/arbcompress"
 	"github.com/offchainlabs/nitro/arbos/addressSet"
 	"github.com/offchainlabs/nitro/arbos/addressTable"
 	"github.com/offchainlabs/nitro/arbos/arbostypes"
@@ -24,9 +27,12 @@ import (
 	"github.com/offchainlabs/nitro/arbos/l1pricing"
 	"github.com/offchainlabs/nitro/arbos/l2pricing"
 	"github.com/offchainlabs/nitro/arbos/merkleAccumulator"
+	"github.com/offchainlabs/nitro/arbos/programs"
 	"github.com/offchainlabs/nitro/arbos/retryables"
 	"github.com/offchainlabs/nitro/arbos/storage"
 	"github.com/offchainlabs/nitro/arbos/util"
+	"github.com/offchainlabs/nitro/cmd/chaininfo"
+	"github.com/offchainlabs/nitro/util/testhelpers/env"
 )
 
 // ArbosState contains ArbOS-related state. It is backed by ArbOS's storage in the persistent stateDB.
@@ -35,23 +41,25 @@ import (
 // persisted beyond the end of the test.)
 
 type ArbosState struct {
-	arbosVersion      uint64                      // version of the ArbOS storage format and semantics
-	upgradeVersion    storage.StorageBackedUint64 // version we're planning to upgrade to, or 0 if not planning to upgrade
-	upgradeTimestamp  storage.StorageBackedUint64 // when to do the planned upgrade
-	networkFeeAccount storage.StorageBackedAddress
-	l1PricingState    *l1pricing.L1PricingState
-	l2PricingState    *l2pricing.L2PricingState
-	retryableState    *retryables.RetryableState
-	addressTable      *addressTable.AddressTable
-	chainOwners       *addressSet.AddressSet
-	sendMerkle        *merkleAccumulator.MerkleAccumulator
-	blockhashes       *blockhash.Blockhashes
-	chainId           storage.StorageBackedBigInt
-	chainConfig       storage.StorageBackedBytes
-	genesisBlockNum   storage.StorageBackedUint64
-	infraFeeAccount   storage.StorageBackedAddress
-	backingStorage    *storage.Storage
-	Burner            burn.Burner
+	arbosVersion           uint64                      // version of the ArbOS storage format and semantics
+	upgradeVersion         storage.StorageBackedUint64 // version we're planning to upgrade to, or 0 if not planning to upgrade
+	upgradeTimestamp       storage.StorageBackedUint64 // when to do the planned upgrade
+	networkFeeAccount      storage.StorageBackedAddress
+	l1PricingState         *l1pricing.L1PricingState
+	l2PricingState         *l2pricing.L2PricingState
+	retryableState         *retryables.RetryableState
+	addressTable           *addressTable.AddressTable
+	chainOwners            *addressSet.AddressSet
+	sendMerkle             *merkleAccumulator.MerkleAccumulator
+	programs               *programs.Programs
+	blockhashes            *blockhash.Blockhashes
+	chainId                storage.StorageBackedBigInt
+	chainConfig            storage.StorageBackedBytes
+	genesisBlockNum        storage.StorageBackedUint64
+	infraFeeAccount        storage.StorageBackedAddress
+	brotliCompressionLevel storage.StorageBackedUint64 // brotli compression level used for pricing
+	backingStorage         *storage.Storage
+	Burner                 burn.Burner
 }
 
 var ErrUninitializedArbOS = errors.New("ArbOS uninitialized")
@@ -71,17 +79,19 @@ func OpenArbosState(stateDB vm.StateDB, burner burn.Burner) (*ArbosState, error)
 		backingStorage.OpenStorageBackedUint64(uint64(upgradeVersionOffset)),
 		backingStorage.OpenStorageBackedUint64(uint64(upgradeTimestampOffset)),
 		backingStorage.OpenStorageBackedAddress(uint64(networkFeeAccountOffset)),
-		l1pricing.OpenL1PricingState(backingStorage.OpenSubStorage(l1PricingSubspace)),
-		l2pricing.OpenL2PricingState(backingStorage.OpenSubStorage(l2PricingSubspace)),
-		retryables.OpenRetryableState(backingStorage.OpenSubStorage(retryablesSubspace), stateDB),
-		addressTable.Open(backingStorage.OpenSubStorage(addressTableSubspace)),
-		addressSet.OpenAddressSet(backingStorage.OpenSubStorage(chainOwnerSubspace)),
-		merkleAccumulator.OpenMerkleAccumulator(backingStorage.OpenSubStorage(sendMerkleSubspace)),
-		blockhash.OpenBlockhashes(backingStorage.OpenSubStorage(blockhashesSubspace)),
+		l1pricing.OpenL1PricingState(backingStorage.OpenCachedSubStorage(l1PricingSubspace)),
+		l2pricing.OpenL2PricingState(backingStorage.OpenCachedSubStorage(l2PricingSubspace)),
+		retryables.OpenRetryableState(backingStorage.OpenCachedSubStorage(retryablesSubspace), stateDB),
+		addressTable.Open(backingStorage.OpenCachedSubStorage(addressTableSubspace)),
+		addressSet.OpenAddressSet(backingStorage.OpenCachedSubStorage(chainOwnerSubspace)),
+		merkleAccumulator.OpenMerkleAccumulator(backingStorage.OpenCachedSubStorage(sendMerkleSubspace)),
+		programs.Open(backingStorage.OpenSubStorage(programsSubspace)),
+		blockhash.OpenBlockhashes(backingStorage.OpenCachedSubStorage(blockhashesSubspace)),
 		backingStorage.OpenStorageBackedBigInt(uint64(chainIdOffset)),
 		backingStorage.OpenStorageBackedBytes(chainConfigSubspace),
 		backingStorage.OpenStorageBackedUint64(uint64(genesisBlockNumOffset)),
 		backingStorage.OpenStorageBackedAddress(uint64(infraFeeAccountOffset)),
+		backingStorage.OpenStorageBackedUint64(uint64(brotliCompressionLevelOffset)),
 		backingStorage,
 		burner,
 	}, nil
@@ -105,16 +115,20 @@ func OpenSystemArbosStateOrPanic(stateDB vm.StateDB, tracingInfo *util.TracingIn
 // NewArbosMemoryBackedArbOSState creates and initializes a memory-backed ArbOS state (for testing only)
 func NewArbosMemoryBackedArbOSState() (*ArbosState, *state.StateDB) {
 	raw := rawdb.NewMemoryDatabase()
-	db := state.NewDatabase(raw)
+	trieConfig := &triedb.Config{Preimages: false, PathDB: pathdb.Defaults}
+	if env.GetTestStateScheme() == rawdb.HashScheme {
+		trieConfig = &triedb.Config{Preimages: false, HashDB: hashdb.Defaults}
+	}
+	db := state.NewDatabaseWithConfig(raw, trieConfig)
 	statedb, err := state.New(common.Hash{}, db, nil)
 	if err != nil {
-		log.Crit("failed to init empty statedb", "error", err)
+		panic("failed to init empty statedb: " + err.Error())
 	}
 	burner := burn.NewSystemBurner(nil, false)
-	chainConfig := params.ArbitrumDevTestChainConfig()
+	chainConfig := chaininfo.ArbitrumDevTestChainConfig()
 	newState, err := InitializeArbosState(statedb, burner, chainConfig, arbostypes.TestInitMessage)
 	if err != nil {
-		log.Crit("failed to open the ArbOS state", "error", err)
+		panic("failed to open the ArbOS state: " + err.Error())
 	}
 	return newState, statedb
 }
@@ -124,7 +138,7 @@ func ArbOSVersion(stateDB vm.StateDB) uint64 {
 	backingStorage := storage.NewGeth(stateDB, burn.NewSystemBurner(nil, false))
 	arbosVersion, err := backingStorage.GetUint64ByUint64(uint64(versionOffset))
 	if err != nil {
-		log.Crit("failed to get the ArbOS version", "error", err)
+		panic("failed to get the ArbOS version: " + err.Error())
 	}
 	return arbosVersion
 }
@@ -139,6 +153,7 @@ const (
 	chainIdOffset
 	genesisBlockNumOffset
 	infraFeeAccountOffset
+	brotliCompressionLevelOffset
 )
 
 type SubspaceID []byte
@@ -152,32 +167,10 @@ var (
 	sendMerkleSubspace   SubspaceID = []byte{5}
 	blockhashesSubspace  SubspaceID = []byte{6}
 	chainConfigSubspace  SubspaceID = []byte{7}
+	programsSubspace     SubspaceID = []byte{8}
 )
 
-// Returns a list of precompiles that only appear in Arbitrum chains (i.e. ArbOS precompiles) at the genesis block
-func getArbitrumOnlyGenesisPrecompiles(chainConfig *params.ChainConfig) []common.Address {
-	rules := chainConfig.Rules(big.NewInt(0), false, 0, chainConfig.ArbitrumChainParams.InitialArbOSVersion)
-	arbPrecompiles := vm.ActivePrecompiles(rules)
-	rules.IsArbitrum = false
-	ethPrecompiles := vm.ActivePrecompiles(rules)
-
-	ethPrecompilesSet := make(map[common.Address]bool)
-	for _, addr := range ethPrecompiles {
-		ethPrecompilesSet[addr] = true
-	}
-
-	var arbOnlyPrecompiles []common.Address
-	for _, addr := range arbPrecompiles {
-		if !ethPrecompilesSet[addr] {
-			arbOnlyPrecompiles = append(arbOnlyPrecompiles, addr)
-		}
-	}
-	return arbOnlyPrecompiles
-}
-
-// During early development we sometimes change the storage format of version 1, for convenience. But as soon as we
-// start running long-lived chains, every change to the storage format will require defining a new version and
-// providing upgrade code.
+var PrecompileMinArbOSVersions = make(map[common.Address]uint64)
 
 func InitializeArbosState(stateDB vm.StateDB, burner burn.Burner, chainConfig *params.ChainConfig, initMessage *arbostypes.ParsedInitMessage) (*ArbosState, error) {
 	sto := storage.NewGeth(stateDB, burner)
@@ -196,8 +189,10 @@ func InitializeArbosState(stateDB vm.StateDB, burner burn.Burner, chainConfig *p
 
 	// Solidity requires call targets have code, but precompiles don't.
 	// To work around this, we give precompiles fake code.
-	for _, genesisPrecompile := range getArbitrumOnlyGenesisPrecompiles(chainConfig) {
-		stateDB.SetCode(genesisPrecompile, []byte{byte(vm.INVALID)})
+	for addr, version := range PrecompileMinArbOSVersions {
+		if version == 0 {
+			stateDB.SetCode(addr, []byte{byte(vm.INVALID)})
+		}
 	}
 
 	// may be the zero address
@@ -206,7 +201,7 @@ func InitializeArbosState(stateDB vm.StateDB, burner burn.Burner, chainConfig *p
 	_ = sto.SetUint64ByUint64(uint64(versionOffset), 1) // initialize to version 1; upgrade at end of this func if needed
 	_ = sto.SetUint64ByUint64(uint64(upgradeVersionOffset), 0)
 	_ = sto.SetUint64ByUint64(uint64(upgradeTimestampOffset), 0)
-	if desiredArbosVersion >= 2 {
+	if desiredArbosVersion >= params.ArbosVersion_2 {
 		_ = sto.SetByUint64(uint64(networkFeeAccountOffset), util.AddressToHash(initialChainOwner))
 	} else {
 		_ = sto.SetByUint64(uint64(networkFeeAccountOffset), common.Hash{}) // the 0 address until an owner sets it
@@ -215,19 +210,20 @@ func InitializeArbosState(stateDB vm.StateDB, burner burn.Burner, chainConfig *p
 	chainConfigStorage := sto.OpenStorageBackedBytes(chainConfigSubspace)
 	_ = chainConfigStorage.Set(initMessage.SerializedChainConfig)
 	_ = sto.SetUint64ByUint64(uint64(genesisBlockNumOffset), chainConfig.ArbitrumChainParams.GenesisBlockNum)
+	_ = sto.SetUint64ByUint64(uint64(brotliCompressionLevelOffset), 0) // default brotliCompressionLevel for fast compression is 0
 
 	initialRewardsRecipient := l1pricing.BatchPosterAddress
-	if desiredArbosVersion >= 2 {
+	if desiredArbosVersion >= params.ArbosVersion_2 {
 		initialRewardsRecipient = initialChainOwner
 	}
-	_ = l1pricing.InitializeL1PricingState(sto.OpenSubStorage(l1PricingSubspace), initialRewardsRecipient, initMessage.InitialL1BaseFee)
-	_ = l2pricing.InitializeL2PricingState(sto.OpenSubStorage(l2PricingSubspace))
-	_ = retryables.InitializeRetryableState(sto.OpenSubStorage(retryablesSubspace))
-	addressTable.Initialize(sto.OpenSubStorage(addressTableSubspace))
-	merkleAccumulator.InitializeMerkleAccumulator(sto.OpenSubStorage(sendMerkleSubspace))
-	blockhash.InitializeBlockhashes(sto.OpenSubStorage(blockhashesSubspace))
+	_ = l1pricing.InitializeL1PricingState(sto.OpenCachedSubStorage(l1PricingSubspace), initialRewardsRecipient, initMessage.InitialL1BaseFee)
+	_ = l2pricing.InitializeL2PricingState(sto.OpenCachedSubStorage(l2PricingSubspace))
+	_ = retryables.InitializeRetryableState(sto.OpenCachedSubStorage(retryablesSubspace))
+	addressTable.Initialize(sto.OpenCachedSubStorage(addressTableSubspace))
+	merkleAccumulator.InitializeMerkleAccumulator(sto.OpenCachedSubStorage(sendMerkleSubspace))
+	blockhash.InitializeBlockhashes(sto.OpenCachedSubStorage(blockhashesSubspace))
 
-	ownersStorage := sto.OpenSubStorage(chainOwnerSubspace)
+	ownersStorage := sto.OpenCachedSubStorage(chainOwnerSubspace)
 	_ = addressSet.Initialize(ownersStorage)
 	_ = addressSet.OpenAddressSet(ownersStorage).Add(initialChainOwner)
 
@@ -272,37 +268,31 @@ func (state *ArbosState) UpgradeArbosVersion(
 			}
 		}
 
-		switch state.arbosVersion {
-		case 1:
+		nextArbosVersion := state.arbosVersion + 1
+		switch nextArbosVersion {
+		case params.ArbosVersion_2:
 			ensure(state.l1PricingState.SetLastSurplus(common.Big0, 1))
-		case 2:
+		case params.ArbosVersion_3:
 			ensure(state.l1PricingState.SetPerBatchGasCost(0))
 			ensure(state.l1PricingState.SetAmortizedCostCapBips(math.MaxUint64))
-		case 3:
+		case params.ArbosVersion_4:
 			// no state changes needed
-		case 4:
+		case params.ArbosVersion_5:
 			// no state changes needed
-		case 5:
+		case params.ArbosVersion_6:
 			// no state changes needed
-		case 6:
+		case params.ArbosVersion_7:
 			// no state changes needed
-		case 7:
+		case params.ArbosVersion_8:
 			// no state changes needed
-		case 8:
+		case params.ArbosVersion_9:
 			// no state changes needed
-		case 9:
+		case params.ArbosVersion_10:
 			ensure(state.l1PricingState.SetL1FeesAvailable(stateDB.GetBalance(
 				l1pricing.L1PricerFundsPoolAddress,
-			)))
-		case 10:
-			if !chainConfig.DebugMode() {
-				// This upgrade isn't finalized so we only want to support it for testing
-				return fmt.Errorf(
-					"the chain is upgrading to unsupported ArbOS version %v, %w",
-					state.arbosVersion+1,
-					ErrFatalNodeOutOfDate,
-				)
-			}
+			).ToBig()))
+
+		case params.ArbosVersion_11:
 			// Update the PerBatchGasCost to a more accurate value compared to the old v6 default.
 			ensure(state.l1PricingState.SetPerBatchGasCost(l1pricing.InitialPerBatchGasCostV12))
 
@@ -318,18 +308,49 @@ func (state *ArbosState) UpgradeArbosVersion(
 			if !firstTime {
 				ensure(state.chainOwners.ClearList())
 			}
+
+		case 12, 13, 14, 15, 16, 17, 18, 19:
+			// these versions are left to Orbit chains for custom upgrades.
+
+		case params.ArbosVersion_20:
+			// Update Brotli compression level for fast compression from 0 to 1
+			ensure(state.SetBrotliCompressionLevel(1))
+
+		case 21, 22, 23, 24, 25, 26, 27, 28, 29:
+			// these versions are left to Orbit chains for custom upgrades.
+
+		case params.ArbosVersion_30:
+			programs.Initialize(state.backingStorage.OpenSubStorage(programsSubspace))
+
+		case params.ArbosVersion_31:
+			params, err := state.Programs().Params()
+			ensure(err)
+			ensure(params.UpgradeToVersion(2))
+			ensure(params.Save())
+
+		case params.ArbosVersion_32:
+			// no change state needed
+
 		default:
 			return fmt.Errorf(
 				"the chain is upgrading to unsupported ArbOS version %v, %w",
-				state.arbosVersion+1,
+				nextArbosVersion,
 				ErrFatalNodeOutOfDate,
 			)
 		}
-		state.arbosVersion++
+
+		// install any new precompiles
+		for addr, version := range PrecompileMinArbOSVersions {
+			if version == nextArbosVersion {
+				stateDB.SetCode(addr, []byte{byte(vm.INVALID)})
+			}
+		}
+
+		state.arbosVersion = nextArbosVersion
 	}
 
-	if firstTime && upgradeTo >= 6 {
-		if upgradeTo < 11 {
+	if firstTime && upgradeTo >= params.ArbosVersion_6 {
+		if upgradeTo < params.ArbosVersion_11 {
 			state.Restrict(state.l1PricingState.SetPerBatchGasCost(l1pricing.InitialPerBatchGasCostV6))
 		}
 		state.Restrict(state.l1PricingState.SetEquilibrationUnits(l1pricing.InitialEquilibrationUnitsV6))
@@ -379,6 +400,17 @@ func (state *ArbosState) SetFormatVersion(val uint64) {
 	state.Restrict(state.backingStorage.SetUint64ByUint64(uint64(versionOffset), val))
 }
 
+func (state *ArbosState) BrotliCompressionLevel() (uint64, error) {
+	return state.brotliCompressionLevel.Get()
+}
+
+func (state *ArbosState) SetBrotliCompressionLevel(val uint64) error {
+	if val <= arbcompress.LEVEL_WELL {
+		return state.brotliCompressionLevel.Set(val)
+	}
+	return errors.New("invalid brotli compression level")
+}
+
 func (state *ArbosState) RetryableState() *retryables.RetryableState {
 	return state.retryableState
 }
@@ -401,9 +433,13 @@ func (state *ArbosState) ChainOwners() *addressSet.AddressSet {
 
 func (state *ArbosState) SendMerkleAccumulator() *merkleAccumulator.MerkleAccumulator {
 	if state.sendMerkle == nil {
-		state.sendMerkle = merkleAccumulator.OpenMerkleAccumulator(state.backingStorage.OpenSubStorage(sendMerkleSubspace))
+		state.sendMerkle = merkleAccumulator.OpenMerkleAccumulator(state.backingStorage.OpenCachedSubStorage(sendMerkleSubspace))
 	}
 	return state.sendMerkle
+}
+
+func (state *ArbosState) Programs() *programs.Programs {
+	return state.programs
 }
 
 func (state *ArbosState) Blockhashes() *blockhash.Blockhashes {

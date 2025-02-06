@@ -3,12 +3,15 @@
 
 package addressTable
 
+// TODO lowercase this package name
+
 import (
 	"bytes"
 	"errors"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
+
 	"github.com/offchainlabs/nitro/arbos/storage"
 	"github.com/offchainlabs/nitro/arbos/util"
 )
@@ -25,7 +28,7 @@ func Initialize(sto *storage.Storage) {
 
 func Open(sto *storage.Storage) *AddressTable {
 	numItems := sto.OpenStorageBackedUint64(0)
-	return &AddressTable{sto, sto.OpenSubStorage([]byte{}), numItems}
+	return &AddressTable{sto.WithoutCache(), sto.OpenSubStorage([]byte{}), numItems}
 }
 
 func (atab *AddressTable) Register(addr common.Address) (uint64, error) {
@@ -101,6 +104,7 @@ func (atab *AddressTable) Decompress(buf []byte) (common.Address, uint64, error)
 		return common.Address{}, 0, err
 	}
 	if len(input) == 20 {
+		// #nosec G115
 		numBytesRead := uint64(rd.Size() - int64(rd.Len()))
 		return common.BytesToAddress(input), numBytesRead, nil
 	} else {
@@ -116,6 +120,7 @@ func (atab *AddressTable) Decompress(buf []byte) (common.Address, uint64, error)
 		if !exists {
 			return common.Address{}, 0, errors.New("invalid index in compressed address")
 		}
+		// #nosec G115
 		numBytesRead := uint64(rd.Size() - int64(rd.Len()))
 		return addr, numBytesRead, nil
 	}

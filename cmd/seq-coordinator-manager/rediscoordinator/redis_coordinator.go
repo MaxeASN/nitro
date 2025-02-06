@@ -5,7 +5,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/offchainlabs/nitro/util/redisutil"
 )
 
@@ -16,6 +17,9 @@ type RedisCoordinator struct {
 
 // UpdatePriorities updates the priority list of sequencers
 func (rc *RedisCoordinator) UpdatePriorities(ctx context.Context, priorities []string) error {
+	if len(priorities) == 0 {
+		return rc.Client.Del(ctx, redisutil.PRIORITIES_KEY).Err()
+	}
 	prioritiesString := strings.Join(priorities, ",")
 	err := rc.Client.Set(ctx, redisutil.PRIORITIES_KEY, prioritiesString, 0).Err()
 	if err != nil {

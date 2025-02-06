@@ -26,7 +26,7 @@ var HTTPConfigDefault = HTTPConfig{
 	Port:           8547,
 	API:            append(node.DefaultConfig.HTTPModules, "eth", "arb"),
 	RPCPrefix:      node.DefaultConfig.HTTPPathPrefix,
-	CORSDomain:     node.DefaultConfig.HTTPCors,
+	CORSDomain:     []string{},
 	VHosts:         node.DefaultConfig.HTTPVirtualHosts,
 	ServerTimeouts: HTTPServerTimeoutConfigDefault,
 }
@@ -45,6 +45,8 @@ var HTTPServerTimeoutConfigDefault = HTTPServerTimeoutConfig{
 	WriteTimeout:      30 * time.Second,
 	IdleTimeout:       120 * time.Second,
 }
+
+const HTTPServerBodyLimitDefault = 0 // Use default from go-ethereum
 
 func (c HTTPConfig) Apply(stackConf *node.Config) {
 	stackConf.HTTPHost = c.Addr
@@ -91,7 +93,7 @@ var WSConfigDefault = WSConfig{
 	Port:      8548,
 	API:       append(node.DefaultConfig.WSModules, "eth", "arb"),
 	RPCPrefix: node.DefaultConfig.WSPathPrefix,
-	Origins:   node.DefaultConfig.WSOrigins,
+	Origins:   []string{},
 	ExposeAll: node.DefaultConfig.WSExposeAll,
 }
 
@@ -137,7 +139,7 @@ type GraphQLConfig struct {
 
 var GraphQLConfigDefault = GraphQLConfig{
 	Enable:     false,
-	CORSDomain: node.DefaultConfig.GraphQLCors,
+	CORSDomain: []string{},
 	VHosts:     node.DefaultConfig.GraphQLVirtualHosts,
 }
 

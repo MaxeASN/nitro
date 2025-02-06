@@ -7,14 +7,13 @@ import (
 	"testing"
 
 	"github.com/offchainlabs/nitro/arbos/arbosState"
-
 	"github.com/offchainlabs/nitro/arbos/storage"
 	"github.com/offchainlabs/nitro/arbos/util"
 )
 
 func TestQueue(t *testing.T) {
 	state, statedb := arbosState.NewArbosMemoryBackedArbOSState()
-	sto := state.BackingStorage().OpenSubStorage([]byte{})
+	sto := state.BackingStorage().OpenCachedSubStorage([]byte{})
 	Require(t, storage.InitializeQueue(sto))
 	q := storage.OpenQueue(sto)
 

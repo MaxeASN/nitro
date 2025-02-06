@@ -9,7 +9,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/offchainlabs/nitro/arbos"
 	"github.com/offchainlabs/nitro/arbos/arbosState"
@@ -37,8 +36,7 @@ type Context struct {
 
 func (c *Context) Burn(amount uint64) error {
 	if c.gasLeft < amount {
-		c.gasLeft = 0
-		return vm.ErrOutOfGas
+		return c.BurnOut()
 	}
 	c.gasLeft -= amount
 	return nil
@@ -49,8 +47,17 @@ func (c *Context) Burned() uint64 {
 	return c.gasSupplied - c.gasLeft
 }
 
+func (c *Context) BurnOut() error {
+	c.gasLeft = 0
+	return vm.ErrOutOfGas
+}
+
+func (c *Context) GasLeft() *uint64 {
+	return &c.gasLeft
+}
+
 func (c *Context) Restrict(err error) {
-	log.Crit("A metered burner was used for access-controlled work", "error", err)
+	panic("A metered burner was used for access-controlled work :" + err.Error())
 }
 
 func (c *Context) HandleError(err error) error {
@@ -65,6 +72,10 @@ func (c *Context) TracingInfo() *util.TracingInfo {
 	return c.tracingInfo
 }
 
+func (c *Context) GetCodeHash(address common.Address) (common.Hash, error) {
+	return c.State.BackingStorage().GetCodeHash(address)
+}
+
 func testContext(caller addr, evm mech) *Context {
 	tracingInfo := util.NewTracingInfo(evm, common.Address{}, types.ArbosAddress, util.TracingDuringEVM)
 	ctx := &Context{
@@ -76,13 +87,13 @@ func testContext(caller addr, evm mech) *Context {
 	}
 	state, err := arbosState.OpenArbosState(evm.StateDB, burn.NewSystemBurner(tracingInfo, false))
 	if err != nil {
-		log.Crit("unable to open arbos state", "error", err)
+		panic("unable to open arbos state :" + err.Error())
 	}
 	ctx.State = state
 	var ok bool
 	ctx.txProcessor, ok = evm.ProcessingHook.(*arbos.TxProcessor)
 	if !ok {
-		log.Crit("must have tx processor")
+		panic("must have tx processor")
 	}
 	return ctx
 }

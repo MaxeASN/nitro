@@ -7,17 +7,21 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/params"
+
 	"github.com/offchainlabs/nitro/arbos/arbosState"
+	"github.com/offchainlabs/nitro/arbos/burn"
 	"github.com/offchainlabs/nitro/arbos/l1pricing"
 	"github.com/offchainlabs/nitro/arbos/util"
+	"github.com/offchainlabs/nitro/cmd/chaininfo"
 	"github.com/offchainlabs/nitro/util/arbmath"
-
-	"github.com/ethereum/go-ethereum/params"
-	"github.com/offchainlabs/nitro/arbos/burn"
 )
 
 type l1PricingTest struct {
@@ -99,7 +103,7 @@ func expectedResultsForL1Test(input *l1PricingTest) *l1TestExpectedResults {
 			availableFunds = availableFundsCap
 		}
 	}
-	fundsWantedForRewards := big.NewInt(int64(input.unitReward * input.unitsPerSecond))
+	fundsWantedForRewards := new(big.Int).SetUint64(input.unitReward * input.unitsPerSecond)
 	unitsAllocated := arbmath.UintToBig(input.unitsPerSecond)
 	if arbmath.BigLessThan(availableFunds, fundsWantedForRewards) {
 		ret.rewardRecipientBalance = availableFunds
@@ -110,7 +114,7 @@ func expectedResultsForL1Test(input *l1PricingTest) *l1TestExpectedResults {
 	uncappedAvailableFunds = arbmath.BigSub(uncappedAvailableFunds, ret.rewardRecipientBalance)
 	ret.unitsRemaining = (3 * input.unitsPerSecond) - unitsAllocated.Uint64()
 
-	maxCollectable := big.NewInt(int64(input.fundsSpent))
+	maxCollectable := new(big.Int).SetUint64(input.fundsSpent)
 	if arbmath.BigLessThan(availableFunds, maxCollectable) {
 		maxCollectable = availableFunds
 	}
@@ -169,9 +173,9 @@ func _testL1PricingFundsDue(t *testing.T, testParams *l1PricingTest, expectedRes
 	Require(t, err)
 
 	// create some fake collection
-	balanceAdded := big.NewInt(int64(testParams.fundsCollectedPerSecond * 3))
+	balanceAdded := new(big.Int).SetUint64(testParams.fundsCollectedPerSecond * 3)
 	unitsAdded := testParams.unitsPerSecond * 3
-	evm.StateDB.AddBalance(l1pricing.L1PricerFundsPoolAddress, balanceAdded)
+	evm.StateDB.AddBalance(l1pricing.L1PricerFundsPoolAddress, uint256.MustFromBig(balanceAdded), tracing.BalanceChangeUnspecified)
 	err = l1p.SetL1FeesAvailable(balanceAdded)
 	Require(t, err)
 	err = l1p.SetUnitsSinceUpdate(unitsAdded)
@@ -187,7 +191,7 @@ func _testL1PricingFundsDue(t *testing.T, testParams *l1PricingTest, expectedRes
 	)
 	Require(t, err)
 	rewardRecipientBalance := evm.StateDB.GetBalance(rewardAddress)
-	if !arbmath.BigEquals(rewardRecipientBalance, expectedResults.rewardRecipientBalance) {
+	if !arbmath.BigEquals(rewardRecipientBalance.ToBig(), expectedResults.rewardRecipientBalance) {
 		Fail(t, rewardRecipientBalance, expectedResults.rewardRecipientBalance)
 	}
 	unitsRemaining, err := l1p.UnitsSinceUpdate()
@@ -196,16 +200,16 @@ func _testL1PricingFundsDue(t *testing.T, testParams *l1PricingTest, expectedRes
 		Fail(t, unitsRemaining, expectedResults.unitsRemaining)
 	}
 	fundsReceived := evm.StateDB.GetBalance(firstPayTo)
-	if !arbmath.BigEquals(fundsReceived, expectedResults.fundsReceived) {
+	if !arbmath.BigEquals(fundsReceived.ToBig(), expectedResults.fundsReceived) {
 		Fail(t, fundsReceived, expectedResults.fundsReceived)
 	}
 	fundsStillHeld := evm.StateDB.GetBalance(l1pricing.L1PricerFundsPoolAddress)
-	if !arbmath.BigEquals(fundsStillHeld, expectedResults.fundsStillHeld) {
+	if !arbmath.BigEquals(fundsStillHeld.ToBig(), expectedResults.fundsStillHeld) {
 		Fail(t, fundsStillHeld, expectedResults.fundsStillHeld)
 	}
 	fundsAvail, err := l1p.L1FeesAvailable()
 	Require(t, err)
-	if fundsStillHeld.Cmp(fundsAvail) != 0 {
+	if fundsStillHeld.ToBig().Cmp(fundsAvail) != 0 {
 		Fail(t, fundsStillHeld, fundsAvail)
 	}
 }
@@ -278,7 +282,9 @@ func _testL1PriceEquilibration(t *testing.T, initialL1BasefeeEstimate *big.Int, 
 			evm.StateDB,
 			evm,
 			3,
+			// #nosec G115
 			uint64(10*(i+1)),
+			// #nosec G115
 			uint64(10*(i+1)+5),
 			bpAddr,
 			arbmath.BigMulByUint(equilibriumL1BasefeeEstimate, unitsToAdd),
@@ -312,7 +318,7 @@ func _withinOnePercent(v1, v2 *big.Int) bool {
 }
 
 func newMockEVMForTesting() *vm.EVM {
-	chainConfig := params.ArbitrumDevTestChainConfig()
+	chainConfig := chaininfo.ArbitrumDevTestChainConfig()
 	_, statedb := arbosState.NewArbosMemoryBackedArbOSState()
 	context := vm.BlockContext{
 		BlockNumber: big.NewInt(0),

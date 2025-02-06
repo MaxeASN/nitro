@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/log"
+
 	"github.com/offchainlabs/nitro/util/testhelpers"
 )
 
@@ -55,7 +56,11 @@ func readLogMessagesFromJSONFile(t *testing.T, path string) ([]string, error) {
 		if !ok {
 			testhelpers.FailImpl(t, "Incorrect record, msg key is missing", "record", record)
 		}
-		messages = append(messages, msg.(string))
+		msgString, ok := msg.(string)
+		if !ok {
+			testhelpers.FailImpl(t, "Incorrect record, msg is not a string", "record", record)
+		}
+		messages = append(messages, msgString)
 	}
 	if errors.Is(err, io.EOF) {
 		return messages, nil
@@ -72,9 +77,10 @@ func testFileHandler(t *testing.T, testCompressed bool) {
 	config.MaxSize = 1
 	config.Compress = testCompressed
 	config.File = testFile
-	fileHandler := globalFileHandlerFactory.newHandler(log.JSONFormat(), &config, testFile)
-	defer func() { testhelpers.RequireImpl(t, globalFileHandlerFactory.close()) }()
-	log.Root().SetHandler(fileHandler)
+	handler, err := HandlerFromLogType("json", globalFileLoggerFactory.newFileWriter(&config, testFile))
+	defer func() { testhelpers.RequireImpl(t, globalFileLoggerFactory.close()) }()
+	testhelpers.RequireImpl(t, err)
+	log.SetDefault(log.NewLogger(handler))
 	expected := []string{"dead", "beef", "ate", "bad", "beef"}
 	for _, e := range expected {
 		log.Warn(e)

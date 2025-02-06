@@ -1,4 +1,4 @@
-// Copyright 2021-2022, Offchain Labs, Inc.
+// Copyright 2021-2024, Offchain Labs, Inc.
 // For license information, see https://github.com/nitro/blob/master/LICENSE
 
 package precompiles
@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/offchainlabs/nitro/arbos/l1pricing"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/params"
+
+	"github.com/offchainlabs/nitro/arbos/l1pricing"
+	"github.com/offchainlabs/nitro/arbos/programs"
+	"github.com/offchainlabs/nitro/util/arbmath"
+	am "github.com/offchainlabs/nitro/util/arbmath"
 )
 
 // ArbOwner precompile provides owners with tools for managing the rollup.
@@ -66,6 +69,9 @@ func (con ArbOwner) SetL2BaseFee(c ctx, evm mech, priceInWei huge) error {
 
 // SetMinimumL2BaseFee sets the minimum base fee needed for a transaction to succeed
 func (con ArbOwner) SetMinimumL2BaseFee(c ctx, evm mech, priceInWei huge) error {
+	if c.txProcessor.MsgIsNonMutating() && priceInWei.Sign() == 0 {
+		return errors.New("minimum base fee must be nonzero")
+	}
 	return c.State.L2PricingState().SetMinBaseFeeWei(priceInWei)
 }
 
@@ -114,34 +120,48 @@ func (con ArbOwner) ScheduleArbOSUpgrade(c ctx, evm mech, newVersion uint64, tim
 	return c.State.ScheduleArbOSUpgrade(newVersion, timestamp)
 }
 
+// Sets equilibration units parameter for L1 price adjustment algorithm
 func (con ArbOwner) SetL1PricingEquilibrationUnits(c ctx, evm mech, equilibrationUnits huge) error {
 	return c.State.L1PricingState().SetEquilibrationUnits(equilibrationUnits)
 }
 
+// Sets inertia parameter for L1 price adjustment algorithm
 func (con ArbOwner) SetL1PricingInertia(c ctx, evm mech, inertia uint64) error {
 	return c.State.L1PricingState().SetInertia(inertia)
 }
 
+// Sets reward recipient address for L1 price adjustment algorithm
 func (con ArbOwner) SetL1PricingRewardRecipient(c ctx, evm mech, recipient addr) error {
 	return c.State.L1PricingState().SetPayRewardsTo(recipient)
 }
 
+// Sets reward amount for L1 price adjustment algorithm, in wei per unit
 func (con ArbOwner) SetL1PricingRewardRate(c ctx, evm mech, weiPerUnit uint64) error {
 	return c.State.L1PricingState().SetPerUnitReward(weiPerUnit)
 }
 
+// Set how much ArbOS charges per L1 gas spent on transaction data.
 func (con ArbOwner) SetL1PricePerUnit(c ctx, evm mech, pricePerUnit *big.Int) error {
 	return c.State.L1PricingState().SetPricePerUnit(pricePerUnit)
 }
 
+// Sets the base charge (in L1 gas) attributed to each data batch in the calldata pricer
 func (con ArbOwner) SetPerBatchGasCharge(c ctx, evm mech, cost int64) error {
 	return c.State.L1PricingState().SetPerBatchGasCost(cost)
 }
 
+// Sets the cost amortization cap in basis points
 func (con ArbOwner) SetAmortizedCostCapBips(c ctx, evm mech, cap uint64) error {
 	return c.State.L1PricingState().SetAmortizedCostCapBips(cap)
 }
 
+// Sets the Brotli compression level used for fast compression
+// Available in ArbOS version 12 with default level as 1
+func (con ArbOwner) SetBrotliCompressionLevel(c ctx, evm mech, level uint64) error {
+	return c.State.SetBrotliCompressionLevel(level)
+}
+
+// Releases surplus funds from L1PricerFundsPoolAddress for use
 func (con ArbOwner) ReleaseL1PricerSurplusFunds(c ctx, evm mech, maxWeiToRelease huge) (huge, error) {
 	balance := evm.StateDB.GetBalance(l1pricing.L1PricerFundsPoolAddress)
 	l1p := c.State.L1PricingState()
@@ -149,7 +169,7 @@ func (con ArbOwner) ReleaseL1PricerSurplusFunds(c ctx, evm mech, maxWeiToRelease
 	if err != nil {
 		return nil, err
 	}
-	weiToTransfer := new(big.Int).Sub(balance, recognized)
+	weiToTransfer := new(big.Int).Sub(balance.ToBig(), recognized)
 	if weiToTransfer.Sign() < 0 {
 		return common.Big0, nil
 	}
@@ -162,6 +182,130 @@ func (con ArbOwner) ReleaseL1PricerSurplusFunds(c ctx, evm mech, maxWeiToRelease
 	return weiToTransfer, nil
 }
 
+// Sets the amount of ink 1 gas buys
+func (con ArbOwner) SetInkPrice(c ctx, evm mech, inkPrice uint32) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	ink, err := arbmath.IntToUint24(inkPrice)
+	if err != nil || ink == 0 {
+		return errors.New("ink price must be a positive uint24")
+	}
+	params.InkPrice = ink
+	return params.Save()
+}
+
+// Sets the maximum depth (in wasm words) a wasm stack may grow
+func (con ArbOwner) SetWasmMaxStackDepth(c ctx, evm mech, depth uint32) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.MaxStackDepth = depth
+	return params.Save()
+}
+
+// Gets the number of free wasm pages a tx gets
+func (con ArbOwner) SetWasmFreePages(c ctx, evm mech, pages uint16) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.FreePages = pages
+	return params.Save()
+}
+
+// Sets the base cost of each additional wasm page
+func (con ArbOwner) SetWasmPageGas(c ctx, evm mech, gas uint16) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.PageGas = gas
+	return params.Save()
+}
+
+// Sets the initial number of pages a wasm may allocate
+func (con ArbOwner) SetWasmPageLimit(c ctx, evm mech, limit uint16) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.PageLimit = limit
+	return params.Save()
+}
+
+// Sets the minimum costs to invoke a program
+func (con ArbOwner) SetWasmMinInitGas(c ctx, _ mech, gas, cached uint64) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.MinInitGas = am.SaturatingUUCast[uint8](am.DivCeil(gas, programs.MinInitGasUnits))
+	params.MinCachedInitGas = am.SaturatingUUCast[uint8](am.DivCeil(cached, programs.MinCachedGasUnits))
+	return params.Save()
+}
+
+// Sets the linear adjustment made to program init costs
+func (con ArbOwner) SetWasmInitCostScalar(c ctx, _ mech, percent uint64) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.InitCostScalar = am.SaturatingUUCast[uint8](am.DivCeil(percent, programs.CostScalarPercent))
+	return params.Save()
+}
+
+// Sets the number of days after which programs deactivate
+func (con ArbOwner) SetWasmExpiryDays(c ctx, _ mech, days uint16) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.ExpiryDays = days
+	return params.Save()
+}
+
+// Sets the age a program must be to perform a keepalive
+func (con ArbOwner) SetWasmKeepaliveDays(c ctx, _ mech, days uint16) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.KeepaliveDays = days
+	return params.Save()
+}
+
+// Sets the number of extra programs ArbOS caches during a given block
+func (con ArbOwner) SetWasmBlockCacheSize(c ctx, _ mech, count uint16) error {
+	params, err := c.State.Programs().Params()
+	if err != nil {
+		return err
+	}
+	params.BlockCacheSize = count
+	return params.Save()
+}
+
+// Adds account as a wasm cache manager
+func (con ArbOwner) AddWasmCacheManager(c ctx, _ mech, manager addr) error {
+	return c.State.Programs().CacheManagers().Add(manager)
+}
+
+// Removes account from the list of wasm cache managers
+func (con ArbOwner) RemoveWasmCacheManager(c ctx, _ mech, manager addr) error {
+	managers := c.State.Programs().CacheManagers()
+	isMember, err := managers.IsMember(manager)
+	if err != nil {
+		return err
+	}
+	if !isMember {
+		return errors.New("tried to remove non-manager")
+	}
+	return managers.Remove(manager, c.State.ArbOSVersion())
+}
+
+// Sets serialized chain config in ArbOS state
 func (con ArbOwner) SetChainConfig(c ctx, evm mech, serializedChainConfig []byte) error {
 	if c == nil {
 		return errors.New("nil context")

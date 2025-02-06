@@ -8,6 +8,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
+
 	"github.com/offchainlabs/nitro/arbutil"
 )
 
@@ -16,6 +17,12 @@ var uniquifyingPrefix = []byte("Arbitrum Nitro Feed:")
 type MessageWithMetadata struct {
 	Message             *L1IncomingMessage `json:"message"`
 	DelayedMessagesRead uint64             `json:"delayedMessagesRead"`
+}
+
+type MessageWithMetadataAndBlockInfo struct {
+	MessageWithMeta MessageWithMetadata
+	BlockHash       *common.Hash
+	BlockMetadata   common.BlockMetadata
 }
 
 var EmptyTestMessageWithMetadata = MessageWithMetadata{

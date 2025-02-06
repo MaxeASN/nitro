@@ -15,7 +15,10 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/params"
+
 	"github.com/offchainlabs/nitro/gethhook"
 	"github.com/offchainlabs/nitro/solgen/go/node_interfacegen"
 	"github.com/offchainlabs/nitro/solgen/go/precompilesgen"
@@ -23,10 +26,34 @@ import (
 	"github.com/offchainlabs/nitro/util/merkletree"
 )
 
+func TestP256VerifyEnabled(t *testing.T) {
+	gethhook.RequireHookedGeth()
+	for _, tc := range []struct {
+		stylusEnabled  bool
+		wantP256Verify bool
+	}{
+		{
+			stylusEnabled:  false,
+			wantP256Verify: false,
+		},
+		{
+			stylusEnabled:  true,
+			wantP256Verify: true,
+		},
+	} {
+		got := false
+		for _, a := range vm.ActivePrecompiles(params.Rules{IsStylus: tc.stylusEnabled}) {
+			got = got || (a == common.BytesToAddress([]byte{0x01, 0x00}))
+		}
+		if got != tc.wantP256Verify {
+			t.Errorf("Got P256Verify enabled: %t, want: %t", got, tc.wantP256Verify)
+		}
+	}
+}
+
 func TestOutboxProofs(t *testing.T) {
 	t.Parallel()
 	gethhook.RequireHookedGeth()
-	rand.Seed(time.Now().UTC().UnixNano())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -35,14 +62,15 @@ func TestOutboxProofs(t *testing.T) {
 	withdrawTopic := arbSysAbi.Events["L2ToL1Tx"].ID
 	merkleTopic := arbSysAbi.Events["SendMerkleUpdate"].ID
 
-	l2info, node, client := CreateTestL2(t, ctx)
-	defer node.StopAndWait()
+	builder := NewNodeBuilder(ctx).DefaultConfig(t, false)
+	cleanup := builder.Build(t)
+	defer cleanup()
 
-	auth := l2info.GetDefaultTransactOpts("Owner", ctx)
+	auth := builder.L2Info.GetDefaultTransactOpts("Owner", ctx)
 
-	arbSys, err := precompilesgen.NewArbSys(types.ArbSysAddress, client)
+	arbSys, err := precompilesgen.NewArbSys(types.ArbSysAddress, builder.L2.Client)
 	Require(t, err)
-	nodeInterface, err := node_interfacegen.NewNodeInterface(types.NodeInterfaceAddress, client)
+	nodeInterface, err := node_interfacegen.NewNodeInterface(types.NodeInterfaceAddress, builder.L2.Client)
 	Require(t, err)
 
 	txnCount := int64(1 + rand.Intn(16))
@@ -71,7 +99,7 @@ func TestOutboxProofs(t *testing.T) {
 		txns = append(txns, tx.Hash())
 
 		time.Sleep(4 * time.Millisecond) // Geth takes a few ms for the receipt to show up
-		_, err = client.TransactionReceipt(ctx, tx.Hash())
+		_, err = builder.L2.Client.TransactionReceipt(ctx, tx.Hash())
 		if err == nil {
 			merkleState, err := arbSys.SendMerkleTreeState(&bind.CallOpts{})
 			Require(t, err, "could not get merkle root")
@@ -86,7 +114,7 @@ func TestOutboxProofs(t *testing.T) {
 
 	for _, tx := range txns {
 		var receipt *types.Receipt
-		receipt, err = client.TransactionReceipt(ctx, tx)
+		receipt, err = builder.L2.Client.TransactionReceipt(ctx, tx)
 		Require(t, err, "No receipt for txn")
 
 		if receipt.Status != types.ReceiptStatusSuccessful {
@@ -118,6 +146,7 @@ func TestOutboxProofs(t *testing.T) {
 		treeSize := root.size
 
 		balanced := treeSize == arbmath.NextPowerOf2(treeSize)/2
+		// #nosec G115
 		treeLevels := int(arbmath.Log2ceil(treeSize)) // the # of levels in the tree
 		proofLevels := treeLevels - 1                 // the # of levels where a hash is needed (all but root)
 		walkLevels := treeLevels                      // the # of levels we need to consider when building walks
@@ -146,6 +175,7 @@ func TestOutboxProofs(t *testing.T) {
 				sibling := place ^ which
 
 				position := merkletree.LevelAndLeaf{
+					// #nosec G115
 					Level: uint64(level),
 					Leaf:  sibling,
 				}
@@ -172,6 +202,7 @@ func TestOutboxProofs(t *testing.T) {
 						leaf := total - 1 // preceding it. We subtract 1 since we count from 0
 
 						partial := merkletree.LevelAndLeaf{
+							// #nosec G115
 							Level: uint64(level),
 							Leaf:  leaf,
 						}
@@ -187,7 +218,7 @@ func TestOutboxProofs(t *testing.T) {
 			// in one lookup, query geth for all the data we need to construct a proof
 			var logs []types.Log
 			if len(query) > 0 {
-				logs, err = client.FilterLogs(ctx, ethereum.FilterQuery{
+				logs, err = builder.L2.Client.FilterLogs(ctx, ethereum.FilterQuery{
 					Addresses: []common.Address{
 						types.ArbSysAddress,
 					},
@@ -252,7 +283,7 @@ func TestOutboxProofs(t *testing.T) {
 
 			if !balanced {
 				// This tree isn't balanced, so we'll need to use the partials to recover the missing info.
-				// To do this, we'll walk the boundry of what's known, computing hashes along the way
+				// To do this, we'll walk the boundary of what's known, computing hashes along the way
 
 				zero := common.Hash{}
 
@@ -260,6 +291,7 @@ func TestOutboxProofs(t *testing.T) {
 				step.Leaf += 1 << step.Level // we start on the min partial's zero-hash sibling
 				known[step] = zero
 
+				// #nosec G115
 				for step.Level < uint64(treeLevels) {
 
 					curr, ok := known[step]

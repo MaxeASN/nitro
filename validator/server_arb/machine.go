@@ -1,15 +1,16 @@
-// Copyright 2021-2022, Offchain Labs, Inc.
-// For license information, see https://github.com/nitro/blob/master/LICENSE
+// Copyright 2021-2023, Offchain Labs, Inc.
+// For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE
 
 package server_arb
 
 /*
-#cgo CFLAGS: -g -Wall -I../../target/include/
+#cgo CFLAGS: -g -I../../target/include/
 #include "arbitrator.h"
 
-ResolvedPreimage preimageResolverC(size_t context, const uint8_t* hash);
+ResolvedPreimage preimageResolverC(size_t context, uint8_t preimageType, const uint8_t* hash);
 */
 import "C"
+
 import (
 	"context"
 	"errors"
@@ -21,13 +22,24 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
+
+	"github.com/offchainlabs/nitro/arbutil"
+	"github.com/offchainlabs/nitro/util/arbmath"
+	"github.com/offchainlabs/nitro/util/containers"
 	"github.com/offchainlabs/nitro/validator"
 )
+
+type u8 = C.uint8_t
+type u16 = C.uint16_t
+type u32 = C.uint32_t
+type u64 = C.uint64_t
+type usize = C.size_t
 
 type MachineInterface interface {
 	CloneMachineInterface() MachineInterface
 	GetStepCount() uint64
 	IsRunning() bool
+	IsErrored() bool
 	ValidForStep(uint64) bool
 	Status() uint8
 	Step(context.Context, uint64) error
@@ -42,15 +54,31 @@ type MachineInterface interface {
 type ArbitratorMachine struct {
 	mutex     sync.Mutex // needed because go finalizers don't synchronize (meaning they aren't thread safe)
 	ptr       *C.struct_Machine
-	contextId *int64 // has a finalizer attached to remove the preimage resolver from the global map
-	frozen    bool   // does not allow anything that changes machine state, not cloned with the machine
+	contextId *int64
+	frozen    bool // does not allow anything that changes machine state, not cloned with the machine
 }
 
 // Assert that ArbitratorMachine implements MachineInterface
 var _ MachineInterface = (*ArbitratorMachine)(nil)
 
-var preimageResolvers sync.Map
-var lastPreimageResolverId int64 // atomic
+var preimageResolvers containers.SyncMap[int64, goPreimageResolverWithRefCounter]
+var lastPreimageResolverId atomic.Int64 // atomic
+
+func dereferenceContextId(contextId *int64) {
+	if contextId != nil {
+		resolverWithRefCounter, ok := preimageResolvers.Load(*contextId)
+		if !ok {
+			panic(fmt.Sprintf("dereferenceContextId: resolver with ref counter not found, contextId: %v", *contextId))
+		}
+
+		refCount := resolverWithRefCounter.refCounter.Add(-1)
+		if refCount < 0 {
+			panic(fmt.Sprintf("dereferenceContextId: ref counter is negative, contextId: %v", *contextId))
+		} else if refCount == 0 {
+			preimageResolvers.Delete(*contextId)
+		}
+	}
+}
 
 // Any future calls to this machine will result in a panic
 func (m *ArbitratorMachine) Destroy() {
@@ -62,11 +90,9 @@ func (m *ArbitratorMachine) Destroy() {
 		// We no longer need a finalizer
 		runtime.SetFinalizer(m, nil)
 	}
-	m.contextId = nil
-}
 
-func freeContextId(context *int64) {
-	preimageResolvers.Delete(*context)
+	dereferenceContextId(m.contextId)
+	m.contextId = nil
 }
 
 func machineFromPointer(ptr *C.struct_Machine) *ArbitratorMachine {
@@ -79,16 +105,25 @@ func machineFromPointer(ptr *C.struct_Machine) *ArbitratorMachine {
 	return mach
 }
 
-func LoadSimpleMachine(wasm string, libraries []string) (*ArbitratorMachine, error) {
+func LoadSimpleMachine(wasm string, libraries []string, debugChain bool) (*ArbitratorMachine, error) {
 	cWasm := C.CString(wasm)
 	cLibraries := CreateCStringList(libraries)
-	mach := C.arbitrator_load_machine(cWasm, cLibraries, C.long(len(libraries)))
+	debug := usize(arbmath.BoolToUint32(debugChain))
+	mach := C.arbitrator_load_machine(cWasm, cLibraries, C.long(len(libraries)), debug)
 	C.free(unsafe.Pointer(cWasm))
 	FreeCStringList(cLibraries, len(libraries))
 	if mach == nil {
 		return nil, fmt.Errorf("failed to load simple machine at path %v", wasm)
 	}
 	return machineFromPointer(mach), nil
+}
+
+func NewFinishedMachine(gs validator.GoGlobalState) *ArbitratorMachine {
+	mach := C.arbitrator_new_finished(GlobalStateToC(gs))
+	if mach == nil {
+		return nil
+	}
+	return machineFromPointer(mach)
 }
 
 func (m *ArbitratorMachine) Freeze() {
@@ -102,6 +137,16 @@ func (m *ArbitratorMachine) Clone() *ArbitratorMachine {
 	defer m.mutex.Unlock()
 	newMach := machineFromPointer(C.arbitrator_clone_machine(m.ptr))
 	newMach.contextId = m.contextId
+
+	if m.contextId != nil {
+		resolverWithRefCounter, ok := preimageResolvers.Load(*m.contextId)
+		if ok {
+			resolverWithRefCounter.refCounter.Add(1)
+		} else {
+			panic(fmt.Sprintf("Clone: resolver with ref counter not found, contextId: %v", *m.contextId))
+		}
+	}
+
 	return newMach
 }
 
@@ -169,8 +214,8 @@ func (m *ArbitratorMachine) ValidForStep(requestedStep uint64) bool {
 	}
 }
 
-func manageConditionByte(ctx context.Context) (*C.uint8_t, func()) {
-	var zero C.uint8_t
+func manageConditionByte(ctx context.Context) (*u8, func()) {
+	var zero u8
 	conditionByte := &zero
 
 	doneEarlyChan := make(chan struct{})
@@ -203,11 +248,10 @@ func (m *ArbitratorMachine) Step(ctx context.Context, count uint64) error {
 	conditionByte, cancel := manageConditionByte(ctx)
 	defer cancel()
 
-	err := C.arbitrator_step(m.ptr, C.uint64_t(count), conditionByte)
+	err := C.arbitrator_step(m.ptr, u64(count), conditionByte)
+	defer C.free(unsafe.Pointer(err))
 	if err != nil {
-		errString := C.GoString(err)
-		C.free(unsafe.Pointer(err))
-		return errors.New(errString)
+		return errors.New(C.GoString(err))
 	}
 
 	return ctx.Err()
@@ -224,7 +268,11 @@ func (m *ArbitratorMachine) StepUntilHostIo(ctx context.Context) error {
 	conditionByte, cancel := manageConditionByte(ctx)
 	defer cancel()
 
-	C.arbitrator_step_until_host_io(m.ptr, conditionByte)
+	err := C.arbitrator_step_until_host_io(m.ptr, conditionByte)
+	defer C.free(unsafe.Pointer(err))
+	if err != nil {
+		return errors.New(C.GoString(err))
+	}
 
 	return ctx.Err()
 }
@@ -250,14 +298,19 @@ func (m *ArbitratorMachine) GetModuleRoot() (hash common.Hash) {
 	}
 	return
 }
+
 func (m *ArbitratorMachine) ProveNextStep() []byte {
 	defer runtime.KeepAlive(m)
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	rustProof := C.arbitrator_gen_proof(m.ptr)
-	proofBytes := C.GoBytes(unsafe.Pointer(rustProof.ptr), C.int(rustProof.len))
-	C.arbitrator_free_proof(rustProof)
+	output := &C.RustBytes{}
+	C.arbitrator_gen_proof(m.ptr, output)
+	defer C.free_rust_bytes(*output)
+	if output.len == 0 {
+		return nil
+	}
+	proofBytes := C.GoBytes(unsafe.Pointer(output.ptr), C.int(output.len))
 
 	return proofBytes
 }
@@ -307,7 +360,7 @@ func (m *ArbitratorMachine) AddSequencerInboxMessage(index uint64, data []byte) 
 		return errors.New("machine frozen")
 	}
 	cbyte := CreateCByteArray(data)
-	status := C.arbitrator_add_inbox_message(m.ptr, C.uint64_t(0), C.uint64_t(index), cbyte)
+	status := C.arbitrator_add_inbox_message(m.ptr, u64(0), u64(index), cbyte)
 	DestroyCByteArray(cbyte)
 	if status != 0 {
 		return errors.New("failed to add sequencer inbox message")
@@ -326,7 +379,7 @@ func (m *ArbitratorMachine) AddDelayedInboxMessage(index uint64, data []byte) er
 	}
 
 	cbyte := CreateCByteArray(data)
-	status := C.arbitrator_add_inbox_message(m.ptr, C.uint64_t(1), C.uint64_t(index), cbyte)
+	status := C.arbitrator_add_inbox_message(m.ptr, u64(1), u64(index), cbyte)
 	DestroyCByteArray(cbyte)
 	if status != 0 {
 		return errors.New("failed to add sequencer inbox message")
@@ -335,27 +388,25 @@ func (m *ArbitratorMachine) AddDelayedInboxMessage(index uint64, data []byte) er
 	}
 }
 
-type GoPreimageResolver = func(common.Hash) ([]byte, error)
+type GoPreimageResolver = func(arbutil.PreimageType, common.Hash) ([]byte, error)
+type goPreimageResolverWithRefCounter struct {
+	resolver   GoPreimageResolver
+	refCounter *atomic.Int64
+}
 
 //export preimageResolver
-func preimageResolver(context C.size_t, ptr unsafe.Pointer) C.ResolvedPreimage {
+func preimageResolver(context C.size_t, ty C.uint8_t, ptr unsafe.Pointer) C.ResolvedPreimage {
 	var hash common.Hash
 	input := (*[1 << 30]byte)(ptr)[:32]
 	copy(hash[:], input)
-	resolver, ok := preimageResolvers.Load(int64(context))
+	resolverWithRefCounter, ok := preimageResolvers.Load(int64(context))
 	if !ok {
+		log.Error("preimageResolver: resolver with ref counter not found", "context", int64(context))
 		return C.ResolvedPreimage{
 			len: -1,
 		}
 	}
-	resolverFunc, ok := resolver.(GoPreimageResolver)
-	if !ok {
-		log.Warn("preimage resolver has wrong type")
-		return C.ResolvedPreimage{
-			len: -1,
-		}
-	}
-	preimage, err := resolverFunc(hash)
+	preimage, err := resolverWithRefCounter.resolver(arbutil.PreimageType(ty), hash)
 	if err != nil {
 		log.Error("preimage resolution failed", "err", err)
 		return C.ResolvedPreimage{
@@ -363,7 +414,7 @@ func preimageResolver(context C.size_t, ptr unsafe.Pointer) C.ResolvedPreimage {
 		}
 	}
 	return C.ResolvedPreimage{
-		ptr: (*C.uint8_t)(C.CBytes(preimage)),
+		ptr: (*u8)(C.CBytes(preimage)),
 		len: (C.ptrdiff_t)(len(preimage)),
 	}
 }
@@ -375,10 +426,36 @@ func (m *ArbitratorMachine) SetPreimageResolver(resolver GoPreimageResolver) err
 	if m.frozen {
 		return errors.New("machine frozen")
 	}
-	id := atomic.AddInt64(&lastPreimageResolverId, 1)
-	preimageResolvers.Store(id, resolver)
+	dereferenceContextId(m.contextId)
+
+	id := lastPreimageResolverId.Add(1)
+	refCounter := atomic.Int64{}
+	refCounter.Store(1)
+	resolverWithRefCounter := goPreimageResolverWithRefCounter{
+		resolver:   resolver,
+		refCounter: &refCounter,
+	}
+	preimageResolvers.Store(id, resolverWithRefCounter)
+
 	m.contextId = &id
-	runtime.SetFinalizer(m.contextId, freeContextId)
-	C.arbitrator_set_context(m.ptr, C.uint64_t(id))
+	C.arbitrator_set_context(m.ptr, u64(id))
+	return nil
+}
+
+func (m *ArbitratorMachine) AddUserWasm(moduleHash common.Hash, module []byte) error {
+	defer runtime.KeepAlive(m)
+	if m.frozen {
+		return errors.New("machine frozen")
+	}
+	hashBytes := [32]u8{}
+	for index, byte := range moduleHash.Bytes() {
+		hashBytes[index] = u8(byte)
+	}
+	C.arbitrator_add_user_wasm(
+		m.ptr,
+		(*u8)(arbutil.SliceToPointer(module)),
+		usize(len(module)),
+		&C.struct_Bytes32{hashBytes},
+	)
 	return nil
 }

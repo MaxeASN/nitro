@@ -1,5 +1,5 @@
-// Copyright 2021-2022, Offchain Labs, Inc.
-// For license information, see https://github.com/nitro/blob/master/LICENSE
+// Copyright 2021-2024, Offchain Labs, Inc.
+// For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE
 
 package arbmath
 
@@ -7,7 +7,9 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
+	"unsafe"
 
+	eth_math "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -27,6 +29,7 @@ func NextOrCurrentPowerOf2(value uint64) uint64 {
 
 // Log2ceil the log2 of the int, rounded up
 func Log2ceil(value uint64) uint64 {
+	// #nosec G115
 	return uint64(64 - bits.LeadingZeros64(value))
 }
 
@@ -46,26 +49,42 @@ type Float interface {
 	~float32 | ~float64
 }
 
-// Ordered is anything that implements comparison operators such as `<` and `>`.
+// Number is anything that implements operators such as `<`, `+` and `/`.
 // Unfortunately, that doesn't include big ints.
-type Ordered interface {
+type Number interface {
 	Integer | Float
 }
 
 // MinInt the minimum of two ints
-func MinInt[T Ordered](value, ceiling T) T {
+func MinInt[T Number](value, ceiling T) T {
 	if value > ceiling {
 		return ceiling
 	}
 	return value
 }
 
-// MaxInt the maximum of two ints
-func MaxInt[T Ordered](value, floor T) T {
-	if value < floor {
-		return floor
+// MaxInt the maximum of one or more ints
+func MaxInt[T Number](values ...T) T {
+	max := values[0]
+	for i := 1; i < len(values); i++ {
+		value := values[i]
+		if value > max {
+			max = value
+		}
 	}
-	return value
+	return max
+}
+
+// Checks if two ints are sufficiently close to one another
+func Within[T Unsigned](a, b, bound T) bool {
+	min := MinInt(a, b)
+	max := MaxInt(a, b)
+	return max-min <= bound
+}
+
+// Checks if an int belongs to [a, b]
+func WithinRange[T Unsigned](value, a, b T) bool {
+	return a <= value && value <= b
 }
 
 // UintToBig casts an int to a huge
@@ -74,8 +93,13 @@ func UintToBig(value uint64) *big.Int {
 }
 
 // FloatToBig casts a float to a huge
+// Returns nil when passed NaN or Infinity
 func FloatToBig(value float64) *big.Int {
-	return new(big.Int).SetInt64(int64(value))
+	if math.IsNaN(value) {
+		return nil
+	}
+	result, _ := new(big.Float).SetFloat64(value).Int(nil)
+	return result
 }
 
 // UintToBigFloat casts a uint to a big float
@@ -92,6 +116,18 @@ func BigToUintSaturating(value *big.Int) uint64 {
 		return math.MaxUint64
 	}
 	return value.Uint64()
+}
+
+// BigToUintSaturating casts a huge to an int, saturating if out of bounds
+func BigToIntSaturating(value *big.Int) int64 {
+	if !value.IsInt64() {
+		if value.Sign() < 0 {
+			return math.MinInt64
+		} else {
+			return math.MaxInt64
+		}
+	}
+	return value.Int64()
 }
 
 // BigToUintOrPanic casts a huge to a uint, panicking if out of bounds
@@ -125,6 +161,11 @@ func BigLessThan(first, second *big.Int) bool {
 // BigGreaterThan check if a huge is greater than another
 func BigGreaterThan(first, second *big.Int) bool {
 	return first.Cmp(second) > 0
+}
+
+// BigGreaterThanOrEqual check if a huge is greater than or equal to another
+func BigGreaterThanOrEqual(first, second *big.Int) bool {
+	return first.Cmp(second) >= 0
 }
 
 // BigMin returns a clone of the minimum of two big integers
@@ -188,8 +229,8 @@ func BigMulByFrac(value *big.Int, numerator, denominator int64) *big.Int {
 	return value
 }
 
-// BigMulByUfrac multiply a huge by a rational whose components are non-negative
-func BigMulByUfrac(value *big.Int, numerator, denominator uint64) *big.Int {
+// BigMulByUFrac multiply a huge by a rational whose components are non-negative
+func BigMulByUFrac(value *big.Int, numerator, denominator uint64) *big.Int {
 	value = new(big.Int).Set(value)
 	value.Mul(value, new(big.Int).SetUint64(numerator))
 	value.Div(value, new(big.Int).SetUint64(denominator))
@@ -231,76 +272,106 @@ func BigFloatMulByUint(multiplicand *big.Float, multiplier uint64) *big.Float {
 	return new(big.Float).Mul(multiplicand, UintToBigFloat(multiplier))
 }
 
-// SaturatingAdd add two int64's without overflow
-func SaturatingAdd(augend, addend int64) int64 {
-	sum := augend + addend
-	if addend > 0 && sum < augend {
-		sum = math.MaxInt64
+func MaxSignedValue[T Signed]() T {
+	// #nosec G115
+	return T((uint64(1) << (8*unsafe.Sizeof(T(0)) - 1)) - 1)
+}
+
+func MinSignedValue[T Signed]() T {
+	// #nosec G115
+	return T(uint64(1) << ((8 * unsafe.Sizeof(T(0))) - 1))
+}
+
+// SaturatingAdd add two integers without overflow
+func SaturatingAdd[T Signed](a, b T) T {
+	sum := a + b
+	if b > 0 && sum < a {
+		sum = MaxSignedValue[T]()
 	}
-	if addend < 0 && sum > augend {
-		sum = math.MinInt64
+	if b < 0 && sum > a {
+		sum = MinSignedValue[T]()
 	}
 	return sum
 }
 
-// SaturatingUAdd add two uint64's without overflow
-func SaturatingUAdd(augend uint64, addend uint64) uint64 {
-	sum := augend + addend
-	if sum < augend || sum < addend {
-		sum = math.MaxUint64
+// SaturatingUAdd add two integers without overflow
+func SaturatingUAdd[T Unsigned](a, b T) T {
+	sum := a + b
+	if sum < a || sum < b {
+		sum = ^T(0)
 	}
 	return sum
 }
 
 // SaturatingSub subtract an int64 from another without overflow
 func SaturatingSub(minuend, subtrahend int64) int64 {
-	return SaturatingAdd(minuend, -subtrahend)
+	if subtrahend == math.MinInt64 {
+		// The absolute value of MinInt64 is one greater than MaxInt64
+		return SaturatingAdd(SaturatingAdd(minuend, math.MaxInt64), 1)
+	}
+	return SaturatingAdd(minuend, SaturatingNeg(subtrahend))
 }
 
-// SaturatingUSub subtract a uint64 from another without underflow
-func SaturatingUSub(minuend uint64, subtrahend uint64) uint64 {
-	if subtrahend >= minuend {
+// SaturatingUSub subtract an integer from another without underflow
+func SaturatingUSub[T Unsigned](a, b T) T {
+	if b >= a {
 		return 0
 	}
-	return minuend - subtrahend
+	return a - b
 }
 
-// SaturatingUMul multiply two uint64's without overflow
-func SaturatingUMul(multiplicand uint64, multiplier uint64) uint64 {
-	product := multiplicand * multiplier
-	if multiplier != 0 && product/multiplier != multiplicand {
-		product = math.MaxUint64
+// SaturatingUMul multiply two integers without over/underflow
+func SaturatingUMul[T Unsigned](a, b T) T {
+	product := a * b
+	if b != 0 && product/b != a {
+		product = ^T(0)
 	}
 	return product
 }
 
-// SaturatingMul multiply two int64's without over/underflow
-func SaturatingMul(multiplicand int64, multiplier int64) int64 {
-	product := multiplicand * multiplier
-	if multiplier != 0 && product/multiplier != multiplicand {
-		if (multiplicand > 0 && multiplier > 0) || (multiplicand < 0 && multiplier < 0) {
-			product = math.MaxInt64
+// SaturatingMul multiply two integers without over/underflow
+func SaturatingMul[T Signed](a, b T) T {
+	product := a * b
+	if b != 0 && product/b != a {
+		if (a > 0 && b > 0) || (a < 0 && b < 0) {
+			product = MaxSignedValue[T]()
 		} else {
-			product = math.MinInt64
+			product = MinSignedValue[T]()
 		}
 	}
 	return product
 }
 
-// SaturatingCast cast a uint64 to an int64, clipping to [0, 2^63-1]
-func SaturatingCast(value uint64) int64 {
-	if value > math.MaxInt64 {
-		return math.MaxInt64
+// SaturatingCast cast an unsigned integer to a signed one, clipping to [0, S::MAX]
+func SaturatingCast[S Signed, T Unsigned](value T) S {
+	tBig := unsafe.Sizeof(T(0)) >= unsafe.Sizeof(S(0))
+	bits := uint64(8 * unsafe.Sizeof(S(0)))
+	sMax := T(1<<bits-1) >> 1
+	if tBig && value > sMax {
+		return S(sMax)
 	}
-	return int64(value)
+	return S(value)
 }
 
-// SaturatingUCast cast an int64 to a uint64, clipping to [0, 2^63-1]
-func SaturatingUCast(value int64) uint64 {
-	if value < 0 {
+// SaturatingUCast cast a signed integer to an unsigned one, clipping to [0, T::MAX]
+func SaturatingUCast[T Unsigned, S Signed](value S) T {
+	if value <= 0 {
 		return 0
 	}
-	return uint64(value)
+	tSmall := unsafe.Sizeof(T(0)) < unsafe.Sizeof(S(0))
+	if tSmall && value >= S(^T(0)) {
+		return ^T(0)
+	}
+	return T(value)
+}
+
+// SaturatingUUCast cast an unsigned integer to another, clipping to [0, U::MAX]
+func SaturatingUUCast[U, T Unsigned](value T) U {
+	tBig := unsafe.Sizeof(T(0)) > unsafe.Sizeof(U(0))
+	if tBig && value > T(^U(0)) {
+		return ^U(0)
+	}
+	return U(value)
 }
 
 func SaturatingCastToUint(value *big.Int) uint64 {
@@ -313,25 +384,44 @@ func SaturatingCastToUint(value *big.Int) uint64 {
 	return value.Uint64()
 }
 
+// Negates an int without underflow
+func SaturatingNeg[T Signed](value T) T {
+	if value < 0 && value == MinSignedValue[T]() {
+		return MaxSignedValue[T]()
+	}
+	return -value
+}
+
+// Integer division but rounding up
+func DivCeil[T Unsigned](value, divisor T) T {
+	if value%divisor == 0 {
+		return value / divisor
+	}
+	return value/divisor + 1
+}
+
 // ApproxExpBasisPoints return the Maclaurin series approximation of e^x, where x is denominated in basis points.
-// This quartic polynomial will underestimate e^x by about 5% as x approaches 20000 bips.
-func ApproxExpBasisPoints(value Bips) Bips {
+// The quartic polynomial will underestimate e^x by about 5% as x approaches 20000 bips.
+func ApproxExpBasisPoints(value Bips, accuracy uint64) Bips {
 	input := value
 	negative := value < 0
 	if negative {
 		input = -value
 	}
+	// This cast is safe because input is always positive
+	// #nosec G115
 	x := uint64(input)
-
 	bips := uint64(OneInBips)
-	res := bips + x/4
-	res = bips + SaturatingUMul(res, x)/(3*bips)
-	res = bips + SaturatingUMul(res, x)/(2*bips)
-	res = bips + SaturatingUMul(res, x)/(1*bips)
+
+	res := bips + x/accuracy
+	for i := uint64(1); i < accuracy; i++ {
+		res = bips + SaturatingUMul(res, x)/((accuracy-i)*bips)
+	}
+
 	if negative {
-		return Bips(SaturatingCast(bips * bips / res))
+		return Bips(SaturatingCast[int64](bips * bips / res))
 	} else {
-		return Bips(SaturatingCast(res))
+		return Bips(SaturatingCast[int64](res))
 	}
 }
 
@@ -375,4 +465,21 @@ func SquareFloat(value float64) float64 {
 func BalancePerEther(balance *big.Int) float64 {
 	balancePerEther, _ := new(big.Float).Quo(new(big.Float).SetInt(balance), new(big.Float).SetFloat64(params.Ether)).Float64()
 	return balancePerEther
+}
+
+// U256Bytes converts big Int to 256bit EVM number.
+// This operation makes a copy of big Int.
+func U256Bytes(n *big.Int) []byte {
+	return eth_math.U256Bytes(new(big.Int).Set(n))
+}
+
+// U256 encodes as a 256 bit two's complement number.
+// This operation makes a copy of big Int.
+func U256(x *big.Int) *big.Int {
+	return eth_math.U256(new(big.Int).Set(x))
+}
+
+// Uint64ToU256Bytes converts uint64 to 256bit EVM number.
+func Uint64ToU256Bytes(n uint64) []byte {
+	return eth_math.U256Bytes(UintToBig(n))
 }

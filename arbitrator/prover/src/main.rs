@@ -1,17 +1,19 @@
-// Copyright 2021-2022, Offchain Labs, Inc.
-// For license information, see https://github.com/nitro/blob/master/LICENSE
+// Copyright 2021-2023, Offchain Labs, Inc.
+// For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE
 
-use arbutil::{format, Color, DebugColor};
-use eyre::{Context, Result};
+#![cfg(feature = "native")]
+
+use arbutil::{format, Bytes32, Color, DebugColor, PreimageType};
+use eyre::{eyre, Context, Result};
 use fnv::{FnvHashMap as HashMap, FnvHashSet as HashSet};
 use prover::{
     machine::{GlobalState, InboxIdentifier, Machine, MachineStatus, PreimageResolver, ProofInfo},
-    utils::{Bytes32, CBytes},
+    prepare::prepare_machine,
+    utils::{file_bytes, hash_preimage, CBytes},
     wavm::Opcode,
 };
-use sha3::{Digest, Keccak256};
-use std::io::BufWriter;
 use std::sync::Arc;
+use std::{convert::TryInto, io::BufWriter};
 use std::{
     fs::File,
     io::{BufReader, ErrorKind, Read, Write},
@@ -34,7 +36,13 @@ struct Opts {
     #[structopt(long)]
     inbox_add_stub_headers: bool,
     #[structopt(long)]
-    always_merkleize: bool,
+    debug_funcs: bool,
+    #[structopt(long)]
+    /// print modules to the console
+    print_modules: bool,
+    #[structopt(long)]
+    /// print wasm module root to the console
+    print_wasmmoduleroot: bool,
     /// profile output instead of generting proofs
     #[structopt(short = "p", long)]
     profile_run: bool,
@@ -67,6 +75,8 @@ struct Opts {
     delayed_inbox: Vec<PathBuf>,
     #[structopt(long)]
     preimages: Option<PathBuf>,
+    #[structopt(long)]
+    stylus_modules: Vec<PathBuf>,
     /// Require that the machine end in the Finished state
     #[structopt(long)]
     require_success: bool,
@@ -77,24 +87,10 @@ struct Opts {
     skip_until_host_io: bool,
     #[structopt(long)]
     max_steps: Option<u64>,
-}
-
-fn parse_size_delim(path: &Path) -> Result<Vec<Vec<u8>>> {
-    let mut file = BufReader::new(File::open(path)?);
-    let mut contents = Vec::new();
-    loop {
-        let mut size_buf = [0u8; 8];
-        match file.read_exact(&mut size_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        let size = u64::from_le_bytes(size_buf) as usize;
-        let mut buf = vec![0u8; size];
-        file.read_exact(&mut buf)?;
-        contents.push(buf);
-    }
-    Ok(contents)
+    // JSON inputs supercede any of the command-line inputs which could
+    // be specified in the JSON file.
+    #[structopt(long)]
+    json_inputs: Option<PathBuf>,
 }
 
 fn file_with_stub_header(path: &Path, headerlength: usize) -> Result<Vec<u8>> {
@@ -128,70 +124,37 @@ struct SimpleProfile {
 const INBOX_HEADER_LEN: usize = 40; // also in test-case's host-io.rs & contracts's OneStepProverHostIo.sol
 const DELAYED_HEADER_LEN: usize = 112; // also in test-case's host-io.rs & contracts's OneStepProverHostIo.sol
 
+#[cfg(feature = "native")]
 fn main() -> Result<()> {
     let opts = Opts::from_args();
 
-    let mut inbox_contents = HashMap::default();
-    let mut inbox_position = opts.inbox_position;
-    let mut delayed_position = opts.delayed_inbox_position;
-    let inbox_header_len;
-    let delayed_header_len;
-    if opts.inbox_add_stub_headers {
-        inbox_header_len = INBOX_HEADER_LEN;
-        delayed_header_len = DELAYED_HEADER_LEN + 1;
-    } else {
-        inbox_header_len = 0;
-        delayed_header_len = 0;
+    if opts.print_wasmmoduleroot {
+        match Machine::new_from_wavm(&opts.binary) {
+            Ok(mach) => {
+                println!("0x{}", mach.get_modules_root());
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("Error loading binary: {err}");
+                return Err(err);
+            }
+        }
     }
 
-    for path in opts.inbox {
-        inbox_contents.insert(
-            (InboxIdentifier::Sequencer, inbox_position),
-            file_with_stub_header(&path, inbox_header_len)?,
-        );
-        println!("read file {:?} to seq. inbox {}", &path, inbox_position);
-        inbox_position += 1;
-    }
-    for path in opts.delayed_inbox {
-        inbox_contents.insert(
-            (InboxIdentifier::Delayed, delayed_position),
-            file_with_stub_header(&path, delayed_header_len)?,
-        );
-        delayed_position += 1;
+    let mut mach = initialize_machine(&opts)?;
+
+    for path in &opts.stylus_modules {
+        let err = || eyre!("failed to read module at {}", path.to_string_lossy().red());
+        let wasm = file_bytes(path).wrap_err_with(err)?;
+        let codehash = &Bytes32::default();
+        mach.add_program(&wasm, codehash, 1, true)
+            .wrap_err_with(err)?;
     }
 
-    let mut preimages: HashMap<Bytes32, CBytes> = HashMap::default();
-    if let Some(path) = opts.preimages {
-        preimages = parse_size_delim(&path)?
-            .into_iter()
-            .map(|b| {
-                let mut hasher = Keccak256::new();
-                hasher.update(&b);
-                (hasher.finalize().into(), CBytes::from(b.as_slice()))
-            })
-            .collect();
+    if opts.print_modules {
+        mach.print_modules();
     }
-    let preimage_resolver =
-        Arc::new(move |_, hash| preimages.get(&hash).cloned()) as PreimageResolver;
 
-    let last_block_hash = decode_hex_arg(&opts.last_block_hash, "--last-block-hash")?;
-    let last_send_root = decode_hex_arg(&opts.last_send_root, "--last-send-root")?;
-
-    let global_state = GlobalState {
-        u64_vals: [opts.inbox_position, opts.position_within_message],
-        bytes32_vals: [last_block_hash, last_send_root],
-    };
-
-    let mut mach = Machine::from_paths(
-        &opts.libraries,
-        &opts.binary,
-        true,
-        opts.always_merkleize,
-        opts.allow_hostapi,
-        global_state,
-        inbox_contents,
-        preimage_resolver,
-    )?;
     if let Some(output_path) = opts.generate_binaries {
         let mut module_root_file = File::create(output_path.join("module-root.txt"))?;
         writeln!(module_root_file, "0x{}", mach.get_modules_root())?;
@@ -210,7 +173,7 @@ fn main() -> Result<()> {
 
     let mut proofs: Vec<ProofInfo> = Vec::new();
     let mut seen_states = HashSet::default();
-    let mut opcode_counts: HashMap<Opcode, usize> = HashMap::default();
+    let mut proving_backoff: HashMap<(Opcode, u64), usize> = HashMap::default();
     let mut opcode_profile: HashMap<Opcode, SimpleProfile> = HashMap::default();
     let mut func_profile: HashMap<(usize, usize), SimpleProfile> = HashMap::default();
     let mut func_stack: Vec<(usize, usize, SimpleProfile)> = Vec::default();
@@ -241,7 +204,16 @@ fn main() -> Result<()> {
         let next_opcode = next_inst.opcode;
 
         if opts.proving_backoff {
-            let count_entry = opcode_counts.entry(next_opcode).or_insert(0);
+            let mut extra_data = 0;
+            if matches!(
+                next_opcode,
+                Opcode::ReadInboxMessage | Opcode::ReadPreImage | Opcode::SwitchThread
+            ) {
+                extra_data = next_inst.argument_data;
+            }
+            let count_entry = proving_backoff
+                .entry((next_opcode, extra_data))
+                .or_insert(0);
             *count_entry += 1;
             let count = *count_entry;
             // Apply an exponential backoff to how often to prove an instruction;
@@ -317,8 +289,12 @@ fn main() -> Result<()> {
             }
         } else {
             let values = mach.get_data_stack();
+            let inters = mach.get_internals_stack();
             if !values.is_empty() {
                 println!("{} {}", "Machine stack".grey(), format::commas(values));
+            }
+            if !inters.is_empty() {
+                println!("{} {}", "Internals    ".grey(), format::commas(inters));
             }
             print!(
                 "Generating proof {} (inst {}) for {}{}",
@@ -368,14 +344,18 @@ fn main() -> Result<()> {
         });
     }
 
+    println!(
+        "End GlobalState:\n  BlockHash: {:?}\n  SendRoot: {:?}\n  Batch: {}\n  PosInBatch: {}",
+        mach.get_global_state().bytes32_vals[0],
+        mach.get_global_state().bytes32_vals[1],
+        mach.get_global_state().u64_vals[0],
+        mach.get_global_state().u64_vals[1]
+    );
     println!("End machine status: {:?}", mach.get_status());
     println!("End machine hash: {}", mach.hash());
     println!("End machine stack: {:?}", mach.get_data_stack());
     println!("End machine backtrace:");
-    for (module, func, pc) in mach.get_backtrace() {
-        let func = rustc_demangle::demangle(&func);
-        println!("  {} {} @ {}", module, func.mint(), pc.blue());
-    }
+    mach.print_backtrace(false);
 
     if let Some(out) = opts.output {
         let out = File::create(out)?;
@@ -387,9 +367,7 @@ fn main() -> Result<()> {
         while let Some((module, func, profile)) = func_stack.pop() {
             sum.total_cycles += profile.total_cycles;
             sum.count += profile.count;
-            let entry = func_profile
-                .entry((module, func))
-                .or_insert_with(SimpleProfile::default);
+            let entry = func_profile.entry((module, func)).or_default();
             entry.count += sum.count;
             entry.total_cycles += sum.total_cycles;
             entry.local_cycles += profile.local_cycles;
@@ -421,18 +399,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-
         let opts_binary = opts.binary;
         let opts_libraries = opts.libraries;
         let format_pc = |module_num: usize, func_num: usize| -> (String, String) {
-            let names = match mach.get_module_names(module_num) {
-                Some(n) => n,
-                None => {
-                    return (
-                        format!("[unknown {}]", module_num),
-                        format!("[unknown {}]", func_num),
-                    );
-                }
+            let Some(names) = mach.get_module_names(module_num) else {
+                return (
+                    format!("[unknown {}]", module_num),
+                    format!("[unknown {}]", func_num),
+                );
             };
             let module_name = if module_num == 0 {
                 names.module.clone()
@@ -503,6 +477,89 @@ fn main() -> Result<()> {
         eprintln!("Machine didn't finish: {}", mach.get_status().red());
         std::process::exit(1);
     }
-
     Ok(())
+}
+
+fn initialize_machine(opts: &Opts) -> eyre::Result<Machine> {
+    if let Some(json_inputs) = opts.json_inputs.clone() {
+        prepare_machine(json_inputs, opts.binary.clone())
+    } else {
+        let mut inbox_contents = HashMap::default();
+        let mut inbox_position = opts.inbox_position;
+        let mut delayed_position = opts.delayed_inbox_position;
+        let inbox_header_len;
+        let delayed_header_len;
+        if opts.inbox_add_stub_headers {
+            inbox_header_len = INBOX_HEADER_LEN;
+            delayed_header_len = DELAYED_HEADER_LEN + 1;
+        } else {
+            inbox_header_len = 0;
+            delayed_header_len = 0;
+        }
+
+        for path in opts.inbox.clone() {
+            inbox_contents.insert(
+                (InboxIdentifier::Sequencer, inbox_position),
+                file_with_stub_header(&path, inbox_header_len)?,
+            );
+            println!("read file {:?} to seq. inbox {}", &path, inbox_position);
+            inbox_position += 1;
+        }
+        for path in opts.delayed_inbox.clone() {
+            inbox_contents.insert(
+                (InboxIdentifier::Delayed, delayed_position),
+                file_with_stub_header(&path, delayed_header_len)?,
+            );
+            delayed_position += 1;
+        }
+
+        let mut preimages: HashMap<PreimageType, HashMap<Bytes32, CBytes>> = HashMap::default();
+        if let Some(path) = opts.preimages.clone() {
+            let mut file = BufReader::new(File::open(path)?);
+            loop {
+                let mut ty_buf = [0u8; 1];
+                match file.read_exact(&mut ty_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let preimage_ty: PreimageType = ty_buf[0].try_into()?;
+
+                let mut size_buf = [0u8; 8];
+                file.read_exact(&mut size_buf)?;
+                let size = u64::from_le_bytes(size_buf) as usize;
+                let mut buf = vec![0u8; size];
+                file.read_exact(&mut buf)?;
+
+                let hash = hash_preimage(&buf, preimage_ty)?;
+                preimages
+                    .entry(preimage_ty)
+                    .or_default()
+                    .insert(hash.into(), buf.as_slice().into());
+            }
+        }
+        let preimage_resolver =
+            Arc::new(move |_, ty, hash| preimages.get(&ty).and_then(|m| m.get(&hash)).cloned())
+                as PreimageResolver;
+
+        let last_block_hash = decode_hex_arg(&opts.last_block_hash, "--last-block-hash")?;
+        let last_send_root = decode_hex_arg(&opts.last_send_root, "--last-send-root")?;
+
+        let global_state = GlobalState {
+            u64_vals: [opts.inbox_position, opts.position_within_message],
+            bytes32_vals: [last_block_hash, last_send_root],
+        };
+
+        Machine::from_paths(
+            &opts.libraries,
+            &opts.binary,
+            true,
+            opts.allow_hostapi,
+            opts.debug_funcs,
+            true,
+            global_state,
+            inbox_contents,
+            preimage_resolver,
+        )
+    }
 }

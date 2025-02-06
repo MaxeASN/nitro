@@ -2,17 +2,19 @@
 
 set -e
 
-mydir=`dirname $0`
+mydir=$(dirname "$0")
 cd "$mydir"
 
 function printusage {
-    echo Usage: $0 --build \[--binary-path PATH\]
-    echo "      "  $0 \<fuzzer-name\> \[--binary-path PATH\] \[--fuzzcache-path PATH\]  \[--nitro-path PATH\]
+    echo Usage: "$0" --build \[--binary-path PATH\]
+    echo "      "  "$0" \<fuzzer-name\> \[--binary-path PATH\] \[--fuzzcache-path PATH\]  \[--nitro-path PATH\] \[--duration DURATION\]
     echo
     echo fuzzer names:
     echo "   " FuzzPrecompiles
     echo "   " FuzzInboxMultiplexer
     echo "   " FuzzStateTransition
+    echo
+    echo "   " duration in minutes
 }
 
 if [[ $# -eq 0 ]]; then
@@ -20,12 +22,12 @@ if [[ $# -eq 0 ]]; then
     exit
 fi
 
-fuzz_executable=../target/bin/system_test.fuzz
 binpath=../target/bin/
 fuzzcachepath=../target/var/fuzz-cache
 nitropath=../
 run_build=false
 test_group=""
+duration=60
 while [[ $# -gt 0 ]]; do
     case $1 in
         --nitro-path)
@@ -55,12 +57,21 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
+        --duration)
+            duration="$2"
+            if ! [[ "$duration" =~ ^[0-9]+$ ]]; then
+                echo "Invalid timeout duration. Please specify positive integer (in minutes)"
+                exit 1
+            fi
+            shift
+            shift
+            ;;
         --build)
             run_build=true
             shift
             ;;
         FuzzPrecompiles | FuzzStateTransition)
-            if [[ ! -z "$test_name" ]]; then
+            if [[ -n "$test_name" ]]; then
                 echo can only run one fuzzer at a time
                 exit 1
             fi
@@ -69,7 +80,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         FuzzInboxMultiplexer)
-            if [[ ! -z "$test_name" ]]; then
+            if [[ -n "$test_name" ]]; then
                 echo can only run one fuzzer at a time
                 exit 1
             fi
@@ -83,12 +94,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$run_build" == "false" && -z "$test_group" ]]; then
+    echo you must specify either --build flag or fuzzer-name
+    printusage
+fi
+
 if $run_build; then
     for build_group in system_tests arbstate; do
-        go test -c ${nitropath}/${build_group} -fuzz Fuzz -o "$binpath"/${build_group}.fuzz
+        go test -c "${nitropath}"/${build_group} -fuzz Fuzz -o "$binpath"/${build_group}.fuzz
     done
 fi
 
-if [[ ! -z $test_group ]]; then
-    "$binpath"/${test_group}.fuzz -test.run "^$" -test.fuzzcachedir "$fuzzcachepath" -test.fuzz $test_name
+if [[ -n $test_group ]]; then
+    timeout "$((60 * duration))" "$binpath"/${test_group}.fuzz -test.run "^$" -test.fuzzcachedir "$fuzzcachepath" -test.fuzz "$test_name" || exit_status=$?
 fi
+
+if  [ -n "$exit_status" ] && [ "$exit_status" -ne 0 ] && [ "$exit_status" -ne 124 ]; then
+    echo "Fuzzing failed."
+    exit "$exit_status"
+fi
+
+echo "Fuzzing succeeded."

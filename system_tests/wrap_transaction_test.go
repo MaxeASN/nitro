@@ -8,18 +8,23 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rpc"
+
 	"github.com/offchainlabs/nitro/arbutil"
 	"github.com/offchainlabs/nitro/solgen/go/precompilesgen"
+	"github.com/offchainlabs/nitro/util/headerreader"
 )
 
-func GetPendingBlockNumber(ctx context.Context, client arbutil.L1Interface) (*big.Int, error) {
+func GetPendingBlockNumber(ctx context.Context, client *ethclient.Client) (*big.Int, error) {
 	// Attempt to get the block number from ArbSys, if it exists
 	arbSys, err := precompilesgen.NewArbSys(common.BigToAddress(big.NewInt(100)), client)
 	if err != nil {
@@ -34,7 +39,7 @@ func GetPendingBlockNumber(ctx context.Context, client arbutil.L1Interface) (*bi
 }
 
 // Will wait until txhash is in the blockchain and return its receipt
-func WaitForTx(ctxinput context.Context, client arbutil.L1Interface, txhash common.Hash, timeout time.Duration) (*types.Receipt, error) {
+func WaitForTx(ctxinput context.Context, client *ethclient.Client, txhash common.Hash, timeout time.Duration) (*types.Receipt, error) {
 	ctx, cancel := context.WithTimeout(ctxinput, timeout)
 	defer cancel()
 
@@ -72,16 +77,47 @@ func WaitForTx(ctxinput context.Context, client arbutil.L1Interface, txhash comm
 	}
 }
 
-func EnsureTxSucceeded(ctx context.Context, client arbutil.L1Interface, tx *types.Transaction) (*types.Receipt, error) {
+func EnsureTxSucceeded(ctx context.Context, client *ethclient.Client, tx *types.Transaction) (*types.Receipt, error) {
 	return EnsureTxSucceededWithTimeout(ctx, client, tx, time.Second*5)
 }
 
-func EnsureTxSucceededWithTimeout(ctx context.Context, client arbutil.L1Interface, tx *types.Transaction, timeout time.Duration) (*types.Receipt, error) {
-	txRes, err := WaitForTx(ctx, client, tx.Hash(), timeout)
+func EnsureTxSucceededWithTimeout(ctx context.Context, client *ethclient.Client, tx *types.Transaction, timeout time.Duration) (*types.Receipt, error) {
+	receipt, err := WaitForTx(ctx, client, tx.Hash(), timeout)
 	if err != nil {
-		return nil, fmt.Errorf("waitFoxTx got: %w", err)
+		return nil, fmt.Errorf("waitFoxTx (tx=%s) got: %w", tx.Hash().Hex(), err)
 	}
-	return txRes, arbutil.DetailTxError(ctx, client, tx, txRes)
+	if receipt.Status == types.ReceiptStatusSuccessful && tx.ChainId().Cmp(simulatedChainID) == 0 {
+		for {
+			safeBlock, err := client.HeaderByNumber(ctx, big.NewInt(int64(rpc.SafeBlockNumber)))
+			if err != nil {
+				return receipt, err
+			}
+			if safeBlock.Number.Cmp(receipt.BlockNumber) >= 0 {
+				break
+			}
+			select {
+			case <-time.After(headerreader.TestConfig.Dangerous.WaitForTxApprovalSafePoll):
+			case <-ctx.Done():
+				return receipt, ctx.Err()
+			}
+		}
+	}
+	return receipt, arbutil.DetailTxError(ctx, client, tx, receipt)
+}
+
+func EnsureTxFailed(t *testing.T, ctx context.Context, client *ethclient.Client, tx *types.Transaction) *types.Receipt {
+	t.Helper()
+	return EnsureTxFailedWithTimeout(t, ctx, client, tx, time.Second*5)
+}
+
+func EnsureTxFailedWithTimeout(t *testing.T, ctx context.Context, client *ethclient.Client, tx *types.Transaction, timeout time.Duration) *types.Receipt {
+	t.Helper()
+	receipt, err := WaitForTx(ctx, client, tx.Hash(), timeout)
+	Require(t, err)
+	if receipt.Status != types.ReceiptStatusFailed {
+		Fatal(t, "unexpected succeess")
+	}
+	return receipt
 }
 
 func headerSubscribeMainLoop(chanOut chan<- *types.Header, ctx context.Context, client ethereum.ChainReader) {

@@ -27,7 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 
 	"github.com/offchainlabs/nitro/arbutil"
-	"github.com/offchainlabs/nitro/broadcaster"
+	m "github.com/offchainlabs/nitro/broadcaster/message"
 	"github.com/offchainlabs/nitro/util/contracts"
 	"github.com/offchainlabs/nitro/util/signature"
 	"github.com/offchainlabs/nitro/util/stopwaiter"
@@ -69,6 +69,7 @@ type Config struct {
 	RequireFeedVersion      bool                     `koanf:"require-feed-version" reload:"hot"`
 	Timeout                 time.Duration            `koanf:"timeout" reload:"hot"`
 	URL                     []string                 `koanf:"url"`
+	SecondaryURL            []string                 `koanf:"secondary-url"`
 	Verify                  signature.VerifierConfig `koanf:"verify"`
 	EnableCompression       bool                     `koanf:"enable-compression" reload:"hot"`
 }
@@ -85,7 +86,8 @@ func ConfigAddOptions(prefix string, f *flag.FlagSet) {
 	f.Bool(prefix+".require-chain-id", DefaultConfig.RequireChainId, "require chain id to be present on connect")
 	f.Bool(prefix+".require-feed-version", DefaultConfig.RequireFeedVersion, "require feed version to be present on connect")
 	f.Duration(prefix+".timeout", DefaultConfig.Timeout, "duration to wait before timing out connection to sequencer feed")
-	f.StringSlice(prefix+".url", DefaultConfig.URL, "URL of sequencer feed source")
+	f.StringSlice(prefix+".url", DefaultConfig.URL, "list of primary URLs of sequencer feed source")
+	f.StringSlice(prefix+".secondary-url", DefaultConfig.SecondaryURL, "list of secondary URLs of sequencer feed source. Would be started in the order they appear in the list when primary feeds fails")
 	signature.FeedVerifierConfigAddOptions(prefix+".verify", f)
 	f.Bool(prefix+".enable-compression", DefaultConfig.EnableCompression, "enable per message deflate compression support")
 }
@@ -96,7 +98,8 @@ var DefaultConfig = Config{
 	RequireChainId:          false,
 	RequireFeedVersion:      false,
 	Verify:                  signature.DefultFeedVerifierConfig,
-	URL:                     []string{""},
+	URL:                     []string{},
+	SecondaryURL:            []string{},
 	Timeout:                 20 * time.Second,
 	EnableCompression:       true,
 }
@@ -108,12 +111,13 @@ var DefaultTestConfig = Config{
 	RequireFeedVersion:      false,
 	Verify:                  signature.DefultFeedVerifierConfig,
 	URL:                     []string{""},
+	SecondaryURL:            []string{},
 	Timeout:                 200 * time.Millisecond,
 	EnableCompression:       true,
 }
 
 type TransactionStreamerInterface interface {
-	AddBroadcastMessages(feedMessages []*broadcaster.BroadcastFeedMessage) error
+	AddBroadcastMessages(feedMessages []*m.BroadcastFeedMessage) error
 }
 
 type BroadcastClient struct {
@@ -126,11 +130,12 @@ type BroadcastClient struct {
 
 	chainId uint64
 
-	// Protects conn and shuttingDown
-	connMutex sync.Mutex
-	conn      net.Conn
+	// Protects conn, shuttingDown and compression
+	connMutex   sync.Mutex
+	conn        net.Conn
+	compression bool
 
-	retryCount int64
+	retryCount atomic.Int64
 
 	retrying                        bool
 	shuttingDown                    bool
@@ -153,10 +158,10 @@ func NewBroadcastClient(
 	txStreamer TransactionStreamerInterface,
 	confirmedSequencerNumberListener chan arbutil.MessageIndex,
 	fatalErrChan chan error,
-	bpVerifier contracts.BatchPosterVerifierInterface,
+	addrVerifier contracts.AddressVerifierInterface,
 	adjustCount func(int32),
 ) (*BroadcastClient, error) {
-	sigVerifier, err := signature.NewVerifier(&config().Verify, bpVerifier)
+	sigVerifier, err := signature.NewVerifier(&config().Verify, addrVerifier)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +192,7 @@ func (bc *BroadcastClient) Start(ctxIn context.Context) {
 				errors.Is(err, ErrIncorrectChainId) ||
 				errors.Is(err, ErrMissingFeedServerVersion) ||
 				errors.Is(err, ErrIncorrectFeedServerVersion) {
-				bc.fatalErrChan <- err
+				bc.fatalErrChan <- fmt.Errorf("failed connecting to server feed due to %w", err)
 				return
 			}
 			if err == nil {
@@ -277,17 +282,33 @@ func (bc *BroadcastClient) connect(ctx context.Context, nextSeqNum arbutil.Messa
 			MinVersion: tls.VersionTLS12,
 		},
 		Extensions: extensions,
+		NetDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var netDialer net.Dialer
+			// For tcp connections, prefer IPv4 over IPv6 to avoid rate limiting issues
+			if network == "tcp" {
+				conn, err := netDialer.DialContext(ctx, "tcp4", addr)
+				if err == nil {
+					return conn, nil
+				}
+				return netDialer.DialContext(ctx, "tcp6", addr)
+			}
+			return netDialer.DialContext(ctx, network, addr)
+		},
 	}
 
 	if bc.isShuttingDown() {
 		return nil, nil
 	}
 
-	conn, br, _, err := timeoutDialer.Dial(ctx, bc.websocketUrl)
+	conn, br, hs, err := timeoutDialer.Dial(ctx, bc.websocketUrl)
 	if errors.Is(err, ErrIncorrectFeedServerVersion) || errors.Is(err, ErrIncorrectChainId) {
 		return nil, err
 	}
 	if err != nil {
+		connectionRejectedError := &ws.ConnectionRejectedError{}
+		if errors.As(err, &connectionRejectedError) && connectionRejectedError.StatusCode() == 429 {
+			log.Error("rate limit exceeded, please run own local relay because too many nodes are connecting to feed from same IP address", "err", err)
+		}
 		return nil, fmt.Errorf("broadcast client unable to connect: %w", err)
 	}
 	if config.RequireChainId && !foundChainId {
@@ -305,6 +326,24 @@ func (bc *BroadcastClient) connect(ctx context.Context, nextSeqNum arbutil.Messa
 		return nil, ErrMissingFeedServerVersion
 	}
 
+	compressionNegotiated := false
+	for _, ext := range hs.Extensions {
+		if ext.Equal(deflateExt) {
+			compressionNegotiated = true
+			break
+		}
+	}
+	if !compressionNegotiated && config.EnableCompression {
+		log.Warn("Compression was not negotiated when connecting to feed server.")
+	}
+	if compressionNegotiated && !config.EnableCompression {
+		err := conn.Close()
+		if err != nil {
+			return nil, fmt.Errorf("error closing connection when negotiated disabled extension: %w", err)
+		}
+		return nil, errors.New("error dialing feed server: negotiated compression ws extension, but it is disabled")
+	}
+
 	var earlyFrameData io.Reader
 	if br != nil {
 		// Depending on how long the client takes to read the response, there may be
@@ -319,6 +358,7 @@ func (bc *BroadcastClient) connect(ctx context.Context, nextSeqNum arbutil.Messa
 
 	bc.connMutex.Lock()
 	bc.conn = conn
+	bc.compression = compressionNegotiated
 	bc.connMutex.Unlock()
 	log.Info("Feed connected", "feedServerVersion", feedServerVersion, "chainId", chainId, "requestedSeqNum", nextSeqNum)
 
@@ -342,7 +382,7 @@ func (bc *BroadcastClient) startBackgroundReader(earlyFrameData io.Reader) {
 			var op ws.OpCode
 			var err error
 			config := bc.config()
-			msg, op, err = wsbroadcastserver.ReadData(ctx, bc.conn, earlyFrameData, config.Timeout, ws.StateClientSide, config.EnableCompression, flateReader)
+			msg, op, err = wsbroadcastserver.ReadData(ctx, bc.conn, earlyFrameData, config.Timeout, ws.StateClientSide, bc.compression, flateReader)
 			if err != nil {
 				if bc.isShuttingDown() {
 					return
@@ -377,7 +417,7 @@ func (bc *BroadcastClient) startBackgroundReader(earlyFrameData io.Reader) {
 			backoffDuration = bc.config().ReconnectInitialBackoff
 
 			if msg != nil {
-				res := broadcaster.BroadcastMessage{}
+				res := m.BroadcastMessage{}
 				err = json.Unmarshal(msg, &res)
 				if err != nil {
 					log.Error("error unmarshalling message", "msg", msg, "err", err)
@@ -428,7 +468,7 @@ func (bc *BroadcastClient) startBackgroundReader(earlyFrameData io.Reader) {
 }
 
 func (bc *BroadcastClient) GetRetryCount() int64 {
-	return atomic.LoadInt64(&bc.retryCount)
+	return bc.retryCount.Load()
 }
 
 func (bc *BroadcastClient) isShuttingDown() bool {
@@ -451,7 +491,7 @@ func (bc *BroadcastClient) retryConnect(ctx context.Context) io.Reader {
 		case <-timer.C:
 		}
 
-		atomic.AddInt64(&bc.retryCount, 1)
+		bc.retryCount.Add(1)
 		earlyFrameData, err := bc.connect(ctx, bc.nextSeqNum)
 		if err == nil {
 			bc.retrying = false
@@ -479,7 +519,7 @@ func (bc *BroadcastClient) StopAndWait() {
 	}
 }
 
-func (bc *BroadcastClient) isValidSignature(ctx context.Context, message *broadcaster.BroadcastFeedMessage) error {
+func (bc *BroadcastClient) isValidSignature(ctx context.Context, message *m.BroadcastFeedMessage) error {
 	if bc.config().Verify.Dangerous.AcceptMissing && bc.sigVerifier == nil {
 		// Verifier disabled
 		return nil

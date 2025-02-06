@@ -1,67 +1,27 @@
-// Copyright 2022, Offchain Labs, Inc.
+// Copyright 2022-2024, Offchain Labs, Inc.
 // For license information, see https://github.com/nitro/blob/master/LICENSE
 
-use crate::machine::{Escape, WasmEnv};
-
 use arbutil::{color, Color};
+use eyre::Result;
+use jit::machine;
+use jit::machine::{Escape, WasmEnv};
+use jit::Opts;
 use structopt::StructOpt;
-use wasmer::Value;
 
-use std::path::PathBuf;
-
-mod arbcompress;
-mod gostack;
-mod machine;
-mod runtime;
-mod socket;
-mod syscall;
-mod test;
-mod wavmio;
-
-#[derive(StructOpt)]
-#[structopt(name = "jit-prover")]
-pub struct Opts {
-    #[structopt(short, long)]
-    binary: PathBuf,
-    #[structopt(long, default_value = "0")]
-    inbox_position: u64,
-    #[structopt(long, default_value = "0")]
-    delayed_inbox_position: u64,
-    #[structopt(long, default_value = "0")]
-    position_within_message: u64,
-    #[structopt(long)]
-    last_block_hash: Option<String>,
-    #[structopt(long)]
-    last_send_root: Option<String>,
-    #[structopt(long)]
-    inbox: Vec<PathBuf>,
-    #[structopt(long)]
-    delayed_inbox: Vec<PathBuf>,
-    #[structopt(long)]
-    preimages: Option<PathBuf>,
-    #[structopt(long)]
-    cranelift: bool,
-    #[structopt(long)]
-    forks: bool,
-    #[structopt(long)]
-    debug: bool,
-}
-
-fn main() {
+fn main() -> Result<()> {
     let opts = Opts::from_args();
-
     let env = match WasmEnv::cli(&opts) {
         Ok(env) => env,
-        Err(err) => panic!("{}", err),
+        Err(err) => panic!("{err}"),
     };
 
     let (instance, env, mut store) = machine::create(&opts, env);
 
-    let main = instance.exports.get_function("run").unwrap();
-    let outcome = main.call(&mut store, &[Value::I32(0), Value::I32(0)]);
+    let main = instance.exports.get_function("_start").unwrap();
+    let outcome = main.call(&mut store, &[]);
     let escape = match outcome {
         Ok(outcome) => {
-            println!("Go returned values {:?}", outcome);
+            println!("Go returned values {outcome:?}");
             None
         }
         Err(outcome) => {
@@ -78,6 +38,13 @@ fn main() {
         }
     };
 
+    let memory_used = instance
+        .exports
+        .get_memory("memory")
+        .unwrap()
+        .view(&store)
+        .size();
+
     let env = env.as_mut(&mut store);
     let user = env.process.socket.is_none();
     let time = format!("{}ms", env.process.timestamp.elapsed().as_millis());
@@ -88,11 +55,12 @@ fn main() {
         Some(Escape::Exit(x)) => (false, format!("Failed in {time} with exit code {x}.")),
         Some(Escape::Failure(err)) => (false, format!("Jit failed with {err} in {time}.")),
         Some(Escape::HostIO(err)) => (false, format!("Hostio failed with {err} in {time}.")),
+        Some(Escape::Child(err)) => (false, format!("Child failed with {err} in {time}.")),
         Some(Escape::SocketError(err)) => (false, format!("Socket failed with {err} in {time}.")),
         None => (false, "Machine exited prematurely".to_owned()),
     };
 
-    if opts.debug {
+    if opts.debug || !success {
         println!("{message}");
     }
 
@@ -101,7 +69,12 @@ fn main() {
         false => Some(message),
     };
 
-    env.send_results(error);
+    env.send_results(error, memory_used);
+
+    if !success && opts.require_success {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // require a usize be at least 32 bits wide

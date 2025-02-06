@@ -11,17 +11,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereum/go-ethereum/log"
-	"github.com/go-redis/redis/v8"
-	"github.com/offchainlabs/nitro/util/stopwaiter"
+	"github.com/redis/go-redis/v9"
 	flag "github.com/spf13/pflag"
+
+	"github.com/ethereum/go-ethereum/log"
+
+	"github.com/offchainlabs/nitro/util/stopwaiter"
 )
 
 type Simple struct {
 	stopwaiter.StopWaiter
 	client      redis.UniversalClient
 	config      SimpleCfgFetcher
-	lockedUntil int64
+	lockedUntil atomic.Int64
 	mutex       sync.Mutex
 	stopping    bool
 	readyToLock func() bool
@@ -29,6 +31,7 @@ type Simple struct {
 }
 
 type SimpleCfg struct {
+	Enable          bool          `koanf:"enable"`
 	MyId            string        `koanf:"my-id"`
 	LockoutDuration time.Duration `koanf:"lockout-duration" reload:"hot"`
 	RefreshDuration time.Duration `koanf:"refresh-duration" reload:"hot"`
@@ -39,10 +42,11 @@ type SimpleCfg struct {
 type SimpleCfgFetcher func() *SimpleCfg
 
 func AddConfigOptions(prefix string, f *flag.FlagSet) {
+	f.Bool(prefix+".enable", DefaultCfg.Enable, "if false, always treat this as locked and don't write the lock to redis")
 	f.String(prefix+".my-id", "", "this node's id prefix when acquiring the lock (optional)")
 	f.Duration(prefix+".lockout-duration", DefaultCfg.LockoutDuration, "how long lock is held")
 	f.Duration(prefix+".refresh-duration", DefaultCfg.RefreshDuration, "how long between consecutive calls to redis")
-	f.String(prefix+".key", prefix+".simple-lock-key", "key for lock")
+	f.String(prefix+".key", DefaultCfg.Key, "key for lock")
 	f.Bool(prefix+".background-lock", DefaultCfg.BackgroundLock, "should node always try grabing lock in background")
 }
 
@@ -60,6 +64,7 @@ func NewSimple(client redis.UniversalClient, config SimpleCfgFetcher, readyToLoc
 }
 
 var DefaultCfg = SimpleCfg{
+	Enable:          true,
 	LockoutDuration: time.Minute,
 	RefreshDuration: time.Second * 10,
 	Key:             "",
@@ -137,10 +142,31 @@ func (l *Simple) AttemptLock(ctx context.Context) bool {
 }
 
 func (l *Simple) Locked() bool {
-	if l.client == nil {
+	if l.client == nil || !l.config().Enable {
 		return true
 	}
 	return time.Now().Before(atomicTimeRead(&l.lockedUntil))
+}
+
+// Returns true if a call to AttemptLock will likely succeed
+func (l *Simple) CouldAcquireLock(ctx context.Context) (bool, error) {
+	if l.Locked() {
+		return true, nil
+	}
+	if l.stopping || !l.readyToLock() {
+		return false, nil
+	}
+	// l.client shouldn't be nil here because Locked would've returned true
+	current, err := l.client.Get(ctx, l.config().Key).Result()
+	if errors.Is(err, redis.Nil) {
+		// Lock is free for the taking
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// return true if the lock is free for the taking or is already ours
+	return current == "" || current == l.myId, nil
 }
 
 func (l *Simple) Release(ctx context.Context) {
@@ -215,12 +241,12 @@ func execTestPipe(pipe redis.Pipeliner, ctx context.Context) error {
 }
 
 // notice: It is possible for two consecutive reads to get decreasing values. That shouldn't matter.
-func atomicTimeRead(addr *int64) time.Time {
-	asint64 := atomic.LoadInt64(addr)
+func atomicTimeRead(addr *atomic.Int64) time.Time {
+	asint64 := addr.Load()
 	return time.UnixMilli(asint64)
 }
 
-func atomicTimeWrite(addr *int64, t time.Time) {
+func atomicTimeWrite(addr *atomic.Int64, t time.Time) {
 	asint64 := t.UnixMilli()
-	atomic.StoreInt64(addr, asint64)
+	addr.Store(asint64)
 }

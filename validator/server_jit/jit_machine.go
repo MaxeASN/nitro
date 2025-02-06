@@ -9,24 +9,32 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
+
 	"github.com/offchainlabs/nitro/util/arbmath"
 	"github.com/offchainlabs/nitro/validator"
 )
 
+var jitWasmMemoryUsage = metrics.NewRegisteredHistogram("jit/wasm/memoryusage", nil, metrics.NewBoundedHistogramSample())
+
 type JitMachine struct {
-	binary  string
-	process *exec.Cmd
-	stdin   io.WriteCloser
+	binary               string
+	process              *exec.Cmd
+	stdin                io.WriteCloser
+	wasmMemoryUsageLimit int
+	maxExecutionTime     time.Duration
 }
 
-func createJitMachine(jitBinary string, binaryPath string, cranelift bool, moduleRoot common.Hash, fatalErrChan chan error) (*JitMachine, error) {
+func createJitMachine(jitBinary string, binaryPath string, cranelift bool, wasmMemoryUsageLimit int, maxExecutionTime time.Duration, _ common.Hash, fatalErrChan chan error) (*JitMachine, error) {
 	invocation := []string{"--binary", binaryPath, "--forks"}
 	if cranelift {
 		invocation = append(invocation, "--cranelift")
@@ -45,9 +53,11 @@ func createJitMachine(jitBinary string, binaryPath string, cranelift bool, modul
 	}()
 
 	machine := &JitMachine{
-		binary:  binaryPath,
-		process: process,
-		stdin:   stdin,
+		binary:               binaryPath,
+		process:              process,
+		stdin:                stdin,
+		wasmMemoryUsageLimit: wasmMemoryUsageLimit,
+		maxExecutionTime:     maxExecutionTime,
 	}
 	return machine, nil
 }
@@ -59,16 +69,14 @@ func (machine *JitMachine) close() {
 	}
 }
 
-type GoPreimageResolver = func(common.Hash) ([]byte, error)
-
 func (machine *JitMachine) prove(
-	ctxIn context.Context, entry *validator.ValidationInput, resolver GoPreimageResolver,
+	ctxIn context.Context, entry *validator.ValidationInput,
 ) (validator.GoGlobalState, error) {
 	ctx, cancel := context.WithCancel(ctxIn)
 	defer cancel() // ensure our cleanup functions run when we're done
 	state := validator.GoGlobalState{}
 
-	timeout := time.Now().Add(60 * time.Second)
+	timeout := time.Now().Add(machine.maxExecutionTime)
 	tcp, err := net.ListenTCP("tcp4", &net.TCPAddr{
 		IP: []byte{127, 0, 0, 1},
 	})
@@ -95,7 +103,7 @@ func (machine *JitMachine) prove(
 	// Wait for the forked process to connect
 	conn, err := tcp.Accept()
 	if err != nil {
-		return state, err
+		return state, fmt.Errorf("error waiting for jit machine to connect back to validator: %w", err)
 	}
 	go func() {
 		<-ctx.Done()
@@ -117,6 +125,16 @@ func (machine *JitMachine) prove(
 	}
 	writeUint8 := func(data uint8) error {
 		return writeExact([]byte{data})
+	}
+	writeUint32 := func(data uint32) error {
+		return writeExact(arbmath.Uint32ToBytes(data))
+	}
+	writeIntAsUint32 := func(data int) error {
+		if data < 0 || data > math.MaxUint32 {
+			return fmt.Errorf("attempted to write out-of-bounds int %v as uint32", data)
+		}
+		// #nosec G115
+		return writeUint32(uint32(data))
 	}
 	writeUint64 := func(data uint64) error {
 		return writeExact(arbmath.UintToBytes(data))
@@ -144,7 +162,6 @@ func (machine *JitMachine) prove(
 
 	const successByte = 0x0
 	const failureByte = 0x1
-	const preimageByte = 0x2
 	const anotherByte = 0x3
 	const readyByte = 0x4
 
@@ -185,15 +202,47 @@ func (machine *JitMachine) prove(
 	}
 
 	// send known preimages
-	knownPreimages := entry.Preimages
-	if err := writeUint64(uint64(len(knownPreimages))); err != nil {
+	preimageTypes := entry.Preimages
+	if err := writeIntAsUint32(len(preimageTypes)); err != nil {
 		return state, err
 	}
-	for hash, preimage := range knownPreimages {
-		if err := writeExact(hash[:]); err != nil {
+	for ty, preimages := range preimageTypes {
+		if err := writeUint8(uint8(ty)); err != nil {
 			return state, err
 		}
-		if err := writeBytes(preimage); err != nil {
+		if err := writeIntAsUint32(len(preimages)); err != nil {
+			return state, err
+		}
+		for hash, preimage := range preimages {
+			if err := writeExact(hash[:]); err != nil {
+				return state, err
+			}
+			if err := writeBytes(preimage); err != nil {
+				return state, err
+			}
+		}
+	}
+
+	localTarget := rawdb.LocalTarget()
+	userWasms := entry.UserWasms[localTarget]
+
+	// if there are user wasms, but only for wrong architecture - error
+	if len(userWasms) == 0 {
+		for arch, userWasms := range entry.UserWasms {
+			if len(userWasms) != 0 {
+				return state, fmt.Errorf("bad stylus arch for validation input. got: %v, expected: %v", arch, localTarget)
+			}
+		}
+	}
+
+	if err := writeIntAsUint32(len(userWasms)); err != nil {
+		return state, err
+	}
+	for moduleHash, program := range userWasms {
+		if err := writeExact(moduleHash[:]); err != nil {
+			return state, err
+		}
+		if err := writeBytes(program); err != nil {
 			return state, err
 		}
 	}
@@ -232,28 +281,6 @@ func (machine *JitMachine) prove(
 			return state, err
 		}
 		switch kind[0] {
-		case preimageByte:
-			hash, err := readHash()
-			if err != nil {
-				return state, err
-			}
-			preimage, err := resolver(hash)
-			if err != nil {
-				log.Error("Failed to resolve preimage for jit", "hash", hash)
-				if err := writeUint8(failureByte); err != nil {
-					return state, err
-				}
-				continue
-			}
-
-			// send the preimage
-			if err := writeUint8(successByte); err != nil {
-				return state, err
-			}
-			if err := writeBytes(preimage); err != nil {
-				return state, err
-			}
-
 		case failureByte:
 			length, err := readUint64()
 			if err != nil {
@@ -275,8 +302,20 @@ func (machine *JitMachine) prove(
 			if state.BlockHash, err = readHash(); err != nil {
 				return state, err
 			}
-			state.SendRoot, err = readHash()
-			return state, err
+			if state.SendRoot, err = readHash(); err != nil {
+				return state, err
+			}
+			memoryUsed, err := readUint64()
+			if err != nil {
+				return state, fmt.Errorf("failed to read memory usage from Jit machine: %w", err)
+			}
+			// #nosec G115
+			if memoryUsed > uint64(machine.wasmMemoryUsageLimit) {
+				log.Warn("memory used by jit wasm exceeds the wasm memory usage limit", "limit", machine.wasmMemoryUsageLimit, "memoryUsed", memoryUsed)
+			}
+			// #nosec G115
+			jitWasmMemoryUsage.Update(int64(memoryUsed))
+			return state, nil
 		default:
 			message := "inter-process communication failure"
 			log.Error("Jit Machine Failure", "message", message)

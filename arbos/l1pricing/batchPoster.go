@@ -9,6 +9,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/offchainlabs/nitro/arbos/addressSet"
 	"github.com/offchainlabs/nitro/arbos/storage"
 	"github.com/offchainlabs/nitro/util/arbmath"
@@ -42,12 +43,12 @@ func InitializeBatchPostersTable(storage *storage.Storage) error {
 	if err := totalFundsDue.SetChecked(common.Big0); err != nil {
 		return err
 	}
-	return addressSet.Initialize(storage.OpenSubStorage(PosterAddrsKey))
+	return addressSet.Initialize(storage.OpenCachedSubStorage(PosterAddrsKey))
 }
 
 func OpenBatchPostersTable(storage *storage.Storage) *BatchPostersTable {
 	return &BatchPostersTable{
-		posterAddrs:   addressSet.OpenAddressSet(storage.OpenSubStorage(PosterAddrsKey)),
+		posterAddrs:   addressSet.OpenAddressSet(storage.OpenCachedSubStorage(PosterAddrsKey)),
 		posterInfo:    storage.OpenSubStorage(PosterInfoKey),
 		totalFundsDue: storage.OpenStorageBackedBigInt(totalFundsDueOffset),
 	}

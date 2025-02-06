@@ -9,14 +9,16 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
+
+	flag "github.com/spf13/pflag"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
-	flag "github.com/spf13/pflag"
 
-	"github.com/offchainlabs/nitro/arbnode/execution"
 	"github.com/offchainlabs/nitro/arbos/arbostypes"
+	"github.com/offchainlabs/nitro/execution"
 	"github.com/offchainlabs/nitro/util/headerreader"
 	"github.com/offchainlabs/nitro/util/stopwaiter"
 )
@@ -26,18 +28,20 @@ type DelayedSequencer struct {
 	l1Reader                 *headerreader.HeaderReader
 	bridge                   *DelayedBridge
 	inbox                    *InboxTracker
-	exec                     *execution.ExecutionEngine
+	reader                   *InboxReader
+	exec                     execution.ExecutionSequencer
 	coordinator              *SeqCoordinator
-	waitingForFinalizedBlock uint64
+	waitingForFinalizedBlock *uint64
 	mutex                    sync.Mutex
 	config                   DelayedSequencerConfigFetcher
 }
 
 type DelayedSequencerConfig struct {
-	Enable              bool  `koanf:"enable" reload:"hot"`
-	FinalizeDistance    int64 `koanf:"finalize-distance" reload:"hot"`
-	RequireFullFinality bool  `koanf:"require-full-finality" reload:"hot"`
-	UseMergeFinality    bool  `koanf:"use-merge-finality" reload:"hot"`
+	Enable              bool          `koanf:"enable" reload:"hot"`
+	FinalizeDistance    int64         `koanf:"finalize-distance" reload:"hot"`
+	RequireFullFinality bool          `koanf:"require-full-finality" reload:"hot"`
+	UseMergeFinality    bool          `koanf:"use-merge-finality" reload:"hot"`
+	RescanInterval      time.Duration `koanf:"rescan-interval" reload:"hot"`
 }
 
 type DelayedSequencerConfigFetcher func() *DelayedSequencerConfig
@@ -47,6 +51,7 @@ func DelayedSequencerConfigAddOptions(prefix string, f *flag.FlagSet) {
 	f.Int64(prefix+".finalize-distance", DefaultDelayedSequencerConfig.FinalizeDistance, "how many blocks in the past L1 block is considered final (ignored when using Merge finality)")
 	f.Bool(prefix+".require-full-finality", DefaultDelayedSequencerConfig.RequireFullFinality, "whether to wait for full finality before sequencing delayed messages")
 	f.Bool(prefix+".use-merge-finality", DefaultDelayedSequencerConfig.UseMergeFinality, "whether to use The Merge's notion of finality before sequencing delayed messages")
+	f.Duration(prefix+".rescan-interval", DefaultDelayedSequencerConfig.RescanInterval, "frequency to rescan for new delayed messages (the parent chain reader's poll-interval config is more important than this)")
 }
 
 var DefaultDelayedSequencerConfig = DelayedSequencerConfig{
@@ -54,20 +59,23 @@ var DefaultDelayedSequencerConfig = DelayedSequencerConfig{
 	FinalizeDistance:    20,
 	RequireFullFinality: false,
 	UseMergeFinality:    true,
+	RescanInterval:      time.Second,
 }
 
 var TestDelayedSequencerConfig = DelayedSequencerConfig{
 	Enable:              true,
 	FinalizeDistance:    20,
 	RequireFullFinality: false,
-	UseMergeFinality:    true,
+	UseMergeFinality:    false,
+	RescanInterval:      time.Millisecond * 100,
 }
 
-func NewDelayedSequencer(l1Reader *headerreader.HeaderReader, reader *InboxReader, exec *execution.ExecutionEngine, coordinator *SeqCoordinator, config DelayedSequencerConfigFetcher) (*DelayedSequencer, error) {
+func NewDelayedSequencer(l1Reader *headerreader.HeaderReader, reader *InboxReader, exec execution.ExecutionSequencer, coordinator *SeqCoordinator, config DelayedSequencerConfigFetcher) (*DelayedSequencer, error) {
 	d := &DelayedSequencer{
 		l1Reader:    l1Reader,
 		bridge:      reader.DelayedBridge(),
 		inbox:       reader.Tracker(),
+		reader:      reader,
 		coordinator: coordinator,
 		exec:        exec,
 		config:      config,
@@ -100,31 +108,35 @@ func (d *DelayedSequencer) sequenceWithoutLockout(ctx context.Context, lastBlock
 	}
 
 	var finalized uint64
-	if config.UseMergeFinality && lastBlockHeader.Difficulty.Sign() == 0 {
+	var finalizedHash common.Hash
+	if config.UseMergeFinality && headerreader.HeaderIndicatesFinalitySupport(lastBlockHeader) {
+		var header *types.Header
 		var err error
 		if config.RequireFullFinality {
-			finalized, err = d.l1Reader.LatestFinalizedBlockNr(ctx)
+			header, err = d.l1Reader.LatestFinalizedBlockHeader(ctx)
 		} else {
-			finalized, err = d.l1Reader.LatestSafeBlockNr(ctx)
+			header, err = d.l1Reader.LatestSafeBlockHeader(ctx)
 		}
 		if err != nil {
 			return err
 		}
+		finalized = header.Number.Uint64()
+		finalizedHash = header.Hash()
 	} else {
 		currentNum := lastBlockHeader.Number.Int64()
 		if currentNum < config.FinalizeDistance {
 			return nil
 		}
+		// #nosec G115
 		finalized = uint64(currentNum - config.FinalizeDistance)
 	}
 
-	if d.waitingForFinalizedBlock > finalized {
+	if d.waitingForFinalizedBlock != nil && *d.waitingForFinalizedBlock > finalized {
 		return nil
 	}
 
-	// Unless we find an unfinalized message (which sets waitingForBlock),
-	// we won't find a new finalized message until FinalizeDistance blocks in the future.
-	d.waitingForFinalizedBlock = lastBlockHeader.Number.Uint64() + 1
+	// Reset what block we're waiting for if we've caught up
+	d.waitingForFinalizedBlock = nil
 
 	dbDelayedCount, err := d.inbox.GetDelayedCount()
 	if err != nil {
@@ -140,13 +152,13 @@ func (d *DelayedSequencer) sequenceWithoutLockout(ctx context.Context, lastBlock
 	var lastDelayedAcc common.Hash
 	var messages []*arbostypes.L1IncomingMessage
 	for pos < dbDelayedCount {
-		msg, acc, parentChainBlockNumber, err := d.inbox.GetDelayedMessageAccumulatorAndParentChainBlockNumber(pos)
+		msg, acc, parentChainBlockNumber, err := d.inbox.GetDelayedMessageAccumulatorAndParentChainBlockNumber(ctx, pos)
 		if err != nil {
 			return err
 		}
 		if parentChainBlockNumber > finalized {
-			// Message isn't finalized yet; stop here
-			d.waitingForFinalizedBlock = parentChainBlockNumber
+			// Message isn't finalized yet; wait for it to be
+			d.waitingForFinalizedBlock = &parentChainBlockNumber
 			break
 		}
 		if lastDelayedAcc != (common.Hash{}) {
@@ -161,13 +173,20 @@ func (d *DelayedSequencer) sequenceWithoutLockout(ctx context.Context, lastBlock
 			}
 		}
 		lastDelayedAcc = acc
+		err = msg.FillInBatchGasCost(func(batchNum uint64) ([]byte, error) {
+			data, _, err := d.reader.GetSequencerMessageBytes(ctx, batchNum)
+			return data, err
+		})
+		if err != nil {
+			return err
+		}
 		messages = append(messages, msg)
 		pos++
 	}
 
 	// Sequence the delayed messages, if any
 	if len(messages) > 0 {
-		delayedBridgeAcc, err := d.bridge.GetAccumulator(ctx, pos-1, new(big.Int).SetUint64(finalized))
+		delayedBridgeAcc, err := d.bridge.GetAccumulator(ctx, pos-1, new(big.Int).SetUint64(finalized), finalizedHash)
 		if err != nil {
 			return err
 		}
@@ -176,6 +195,7 @@ func (d *DelayedSequencer) sequenceWithoutLockout(ctx context.Context, lastBlock
 			return fmt.Errorf("inbox reader at delayed message %v db accumulator %v doesn't match delayed bridge accumulator %v at L1 block %v", pos-1, lastDelayedAcc, delayedBridgeAcc, finalized)
 		}
 		for i, msg := range messages {
+			// #nosec G115
 			err = d.exec.SequenceDelayedMessage(msg, startPos+uint64(i))
 			if err != nil {
 				return err
@@ -200,19 +220,39 @@ func (d *DelayedSequencer) run(ctx context.Context) {
 	headerChan, cancel := d.l1Reader.Subscribe(false)
 	defer cancel()
 
+	latestHeader, err := d.l1Reader.LastHeader(ctx)
+	if err != nil {
+		log.Warn("delayed sequencer: failed to get latest header", "err", err)
+		latestHeader = nil
+	}
+	rescanTimer := time.NewTimer(d.config().RescanInterval)
 	for {
+		if !rescanTimer.Stop() {
+			select {
+			case <-rescanTimer.C:
+			default:
+			}
+		}
+		if latestHeader != nil {
+			rescanTimer.Reset(d.config().RescanInterval)
+		}
+		var ok bool
 		select {
-		case nextHeader, ok := <-headerChan:
+		case latestHeader, ok = <-headerChan:
 			if !ok {
-				log.Info("delayed sequencer: header channel close")
+				log.Debug("delayed sequencer: header channel close")
 				return
 			}
-			if err := d.trySequence(ctx, nextHeader); err != nil {
-				log.Error("Delayed sequencer error", "err", err)
+		case <-rescanTimer.C:
+			if latestHeader == nil {
+				continue
 			}
 		case <-ctx.Done():
-			log.Info("delayed sequencer: context done", "err", ctx.Err())
+			log.Debug("delayed sequencer: context done", "err", ctx.Err())
 			return
+		}
+		if err := d.trySequence(ctx, latestHeader); err != nil {
+			log.Error("Delayed sequencer error", "err", err)
 		}
 	}
 }

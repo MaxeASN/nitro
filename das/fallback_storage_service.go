@@ -10,7 +10,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/offchainlabs/nitro/arbstate"
+
+	"github.com/offchainlabs/nitro/arbstate/daprovider"
 	"github.com/offchainlabs/nitro/das/dastree"
 	"github.com/offchainlabs/nitro/util/arbmath"
 	"github.com/offchainlabs/nitro/util/pretty"
@@ -18,7 +19,7 @@ import (
 
 type FallbackStorageService struct {
 	StorageService
-	backup                     arbstate.DataAvailabilityReader
+	backup                     daprovider.DASReader
 	backupHealthChecker        DataAvailabilityServiceHealthChecker
 	backupRetentionSeconds     uint64
 	ignoreRetentionWriteErrors bool
@@ -32,7 +33,7 @@ type FallbackStorageService struct {
 // a successful GetByHash result from the backup is Put into the primary.
 func NewFallbackStorageService(
 	primary StorageService,
-	backup arbstate.DataAvailabilityReader,
+	backup daprovider.DASReader,
 	backupHealthChecker DataAvailabilityServiceHealthChecker,
 	backupRetentionSeconds uint64, // how long to retain data that we copy in from the backup (MaxUint64 means forever)
 	ignoreRetentionWriteErrors bool, // if true, don't return error if write of retention data to primary fails
@@ -85,6 +86,7 @@ func (f *FallbackStorageService) GetByHash(ctx context.Context, key common.Hash)
 		}
 		if dastree.ValidHash(key, data) {
 			putErr := f.StorageService.Put(
+				// #nosec G115
 				ctx, data, arbmath.SaturatingUAdd(uint64(time.Now().Unix()), f.backupRetentionSeconds),
 			)
 			if putErr != nil && !f.ignoreRetentionWriteErrors {

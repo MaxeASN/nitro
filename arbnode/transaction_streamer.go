@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -17,23 +18,22 @@ import (
 	"testing"
 	"time"
 
-	"errors"
-
 	flag "github.com/spf13/pflag"
-	"github.com/syndtr/goleveldb/leveldb"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 
-	"github.com/offchainlabs/nitro/arbnode/execution"
 	"github.com/offchainlabs/nitro/arbos/arbostypes"
 	"github.com/offchainlabs/nitro/arbutil"
 	"github.com/offchainlabs/nitro/broadcaster"
+	m "github.com/offchainlabs/nitro/broadcaster/message"
+	"github.com/offchainlabs/nitro/execution"
 	"github.com/offchainlabs/nitro/staker"
+	"github.com/offchainlabs/nitro/util/arbmath"
+	"github.com/offchainlabs/nitro/util/dbutil"
 	"github.com/offchainlabs/nitro/util/sharedmetrics"
 	"github.com/offchainlabs/nitro/util/stopwaiter"
 )
@@ -44,13 +44,14 @@ type TransactionStreamer struct {
 	stopwaiter.StopWaiter
 
 	chainConfig      *params.ChainConfig
-	exec             *execution.ExecutionEngine
+	exec             execution.ExecutionSequencer
 	execLastMsgCount arbutil.MessageIndex
 	validator        *staker.BlockValidator
 
-	db           ethdb.Database
-	fatalErrChan chan<- error
-	config       TransactionStreamerConfigFetcher
+	db             ethdb.Database
+	fatalErrChan   chan<- error
+	config         TransactionStreamerConfigFetcher
+	snapSyncConfig *SnapSyncConfig
 
 	insertionMutex     sync.Mutex // cannot be acquired while reorgMutex is held
 	reorgMutex         sync.RWMutex
@@ -58,49 +59,56 @@ type TransactionStreamer struct {
 
 	nextAllowedFeedReorgLog time.Time
 
-	broadcasterQueuedMessages            []arbostypes.MessageWithMetadata
-	broadcasterQueuedMessagesPos         uint64
+	broadcasterQueuedMessages            []arbostypes.MessageWithMetadataAndBlockInfo
+	broadcasterQueuedMessagesPos         atomic.Uint64
 	broadcasterQueuedMessagesActiveReorg bool
 
 	coordinator     *SeqCoordinator
 	broadcastServer *broadcaster.Broadcaster
 	inboxReader     *InboxReader
 	delayedBridge   *DelayedBridge
+
+	trackBlockMetadataFrom arbutil.MessageIndex
 }
 
 type TransactionStreamerConfig struct {
 	MaxBroadcasterQueueSize int           `koanf:"max-broadcaster-queue-size"`
 	MaxReorgResequenceDepth int64         `koanf:"max-reorg-resequence-depth" reload:"hot"`
 	ExecuteMessageLoopDelay time.Duration `koanf:"execute-message-loop-delay" reload:"hot"`
+	TrackBlockMetadataFrom  uint64        `koanf:"track-block-metadata-from"`
 }
 
 type TransactionStreamerConfigFetcher func() *TransactionStreamerConfig
 
 var DefaultTransactionStreamerConfig = TransactionStreamerConfig{
-	MaxBroadcasterQueueSize: 1024,
+	MaxBroadcasterQueueSize: 50_000,
 	MaxReorgResequenceDepth: 1024,
 	ExecuteMessageLoopDelay: time.Millisecond * 100,
+	TrackBlockMetadataFrom:  0,
 }
 
 var TestTransactionStreamerConfig = TransactionStreamerConfig{
 	MaxBroadcasterQueueSize: 10_000,
 	MaxReorgResequenceDepth: 128 * 1024,
 	ExecuteMessageLoopDelay: time.Millisecond,
+	TrackBlockMetadataFrom:  0,
 }
 
 func TransactionStreamerConfigAddOptions(prefix string, f *flag.FlagSet) {
 	f.Int(prefix+".max-broadcaster-queue-size", DefaultTransactionStreamerConfig.MaxBroadcasterQueueSize, "maximum cache of pending broadcaster messages")
 	f.Int64(prefix+".max-reorg-resequence-depth", DefaultTransactionStreamerConfig.MaxReorgResequenceDepth, "maximum number of messages to attempt to resequence on reorg (0 = never resequence, -1 = always resequence)")
 	f.Duration(prefix+".execute-message-loop-delay", DefaultTransactionStreamerConfig.ExecuteMessageLoopDelay, "delay when polling calls to execute messages")
+	f.Uint64(prefix+".track-block-metadata-from", DefaultTransactionStreamerConfig.TrackBlockMetadataFrom, "this is the block number starting from which blockmetadata is being tracked in the local disk and is being published to the feed. This is also the starting position for bulk syncing of missing blockmetadata. Setting to zero (default value) disables this")
 }
 
 func NewTransactionStreamer(
 	db ethdb.Database,
 	chainConfig *params.ChainConfig,
-	exec *execution.ExecutionEngine,
+	exec execution.ExecutionSequencer,
 	broadcastServer *broadcaster.Broadcaster,
 	fatalErrChan chan<- error,
 	config TransactionStreamerConfigFetcher,
+	snapSyncConfig *SnapSyncConfig,
 ) (*TransactionStreamer, error) {
 	streamer := &TransactionStreamer{
 		exec:               exec,
@@ -110,14 +118,32 @@ func NewTransactionStreamer(
 		broadcastServer:    broadcastServer,
 		fatalErrChan:       fatalErrChan,
 		config:             config,
+		snapSyncConfig:     snapSyncConfig,
 	}
-	streamer.exec.SetTransactionStreamer(streamer)
 	err := streamer.cleanupInconsistentState()
 	if err != nil {
 		return nil, err
 	}
+	if config().TrackBlockMetadataFrom != 0 {
+		trackBlockMetadataFrom, err := exec.BlockNumberToMessageIndex(config().TrackBlockMetadataFrom)
+		if err != nil {
+			return nil, err
+		}
+		streamer.trackBlockMetadataFrom = trackBlockMetadataFrom
+	}
 	return streamer, nil
 }
+
+// Represents a block's hash in the database.
+// Necessary because RLP decoder doesn't produce nil values by default.
+type blockHashDBValue struct {
+	BlockHash *common.Hash `rlp:"nil"`
+}
+
+const (
+	BlockHashMismatchLogMsg    = "BlockHash from feed doesn't match locally computed hash. Check feed source."
+	FailedToGetMsgResultFromDB = "Reading message result remotely."
+)
 
 // Encodes a uint64 as bytes in a lexically sortable manner for database iteration.
 // Generally this is only used for database keys, which need sorted.
@@ -157,6 +183,10 @@ func (s *TransactionStreamer) SetInboxReaders(inboxReader *InboxReader, delayedB
 	}
 	s.inboxReader = inboxReader
 	s.delayedBridge = delayedBridge
+}
+
+func (s *TransactionStreamer) ChainConfig() *params.ChainConfig {
+	return s.chainConfig
 }
 
 func (s *TransactionStreamer) cleanupInconsistentState() error {
@@ -246,7 +276,7 @@ func deleteFromRange(ctx context.Context, db ethdb.Database, prefix []byte, star
 
 // The insertion mutex must be held. This acquires the reorg mutex.
 // Note: oldMessages will be empty if reorgHook is nil
-func (s *TransactionStreamer) reorg(batch ethdb.Batch, count arbutil.MessageIndex, newMessages []arbostypes.MessageWithMetadata) error {
+func (s *TransactionStreamer) reorg(batch ethdb.Batch, count arbutil.MessageIndex, newMessages []arbostypes.MessageWithMetadataAndBlockInfo) error {
 	if count == 0 {
 		return errors.New("cannot reorg out init message")
 	}
@@ -261,6 +291,7 @@ func (s *TransactionStreamer) reorg(batch ethdb.Batch, count arbutil.MessageInde
 		return err
 	}
 	config := s.config()
+	// #nosec G115
 	maxResequenceMsgCount := count + arbutil.MessageIndex(config.MaxReorgResequenceDepth)
 	if config.MaxReorgResequenceDepth >= 0 && maxResequenceMsgCount < targetMsgCount {
 		log.Error(
@@ -335,10 +366,19 @@ func (s *TransactionStreamer) reorg(batch ethdb.Batch, count arbutil.MessageInde
 	s.reorgMutex.Lock()
 	defer s.reorgMutex.Unlock()
 
-	err = s.exec.Reorg(count, newMessages, oldMessages)
+	messagesResults, err := s.exec.Reorg(count, newMessages, oldMessages)
 	if err != nil {
 		return err
 	}
+
+	messagesWithComputedBlockHash := make([]arbostypes.MessageWithMetadataAndBlockInfo, 0, len(messagesResults))
+	for i := 0; i < len(messagesResults); i++ {
+		messagesWithComputedBlockHash = append(messagesWithComputedBlockHash, arbostypes.MessageWithMetadataAndBlockInfo{
+			MessageWithMeta: newMessages[i].MessageWithMeta,
+			BlockHash:       &messagesResults[i].BlockHash,
+		})
+	}
+	s.broadcastMessages(messagesWithComputedBlockHash, count)
 
 	if s.validator != nil {
 		err = s.validator.Reorg(s.GetContext(), count)
@@ -347,9 +387,34 @@ func (s *TransactionStreamer) reorg(batch ethdb.Batch, count arbutil.MessageInde
 		}
 	}
 
+	err = deleteStartingAt(s.db, batch, messageResultPrefix, uint64ToKey(uint64(count)))
+	if err != nil {
+		return err
+	}
+	err = deleteStartingAt(s.db, batch, blockHashInputFeedPrefix, uint64ToKey(uint64(count)))
+	if err != nil {
+		return err
+	}
+	err = deleteStartingAt(s.db, batch, blockMetadataInputFeedPrefix, uint64ToKey(uint64(count)))
+	if err != nil {
+		return err
+	}
+	err = deleteStartingAt(s.db, batch, missingBlockMetadataInputFeedPrefix, uint64ToKey(uint64(count)))
+	if err != nil {
+		return err
+	}
 	err = deleteStartingAt(s.db, batch, messagePrefix, uint64ToKey(uint64(count)))
 	if err != nil {
 		return err
+	}
+
+	for i := 0; i < len(messagesResults); i++ {
+		// #nosec G115
+		pos := count + arbutil.MessageIndex(i)
+		err = s.storeResult(pos, *messagesResults[i], batch)
+		if err != nil {
+			return err
+		}
 	}
 
 	return setMessageCount(batch, count)
@@ -389,7 +454,55 @@ func (s *TransactionStreamer) GetMessage(seqNum arbutil.MessageIndex) (*arbostyp
 		return nil, err
 	}
 
+	err = message.Message.FillInBatchGasCost(func(batchNum uint64) ([]byte, error) {
+		ctx, err := s.GetContextSafe()
+		if err != nil {
+			return nil, err
+		}
+		data, _, err := s.inboxReader.GetSequencerMessageBytes(ctx, batchNum)
+		return data, err
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &message, nil
+}
+
+func (s *TransactionStreamer) getMessageWithMetadataAndBlockInfo(seqNum arbutil.MessageIndex) (*arbostypes.MessageWithMetadataAndBlockInfo, error) {
+	msg, err := s.GetMessage(seqNum)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get block hash.
+	// To keep it backwards compatible, since it is possible that a message related
+	// to a sequence number exists in the database, but the block hash doesn't.
+	key := dbKey(blockHashInputFeedPrefix, uint64(seqNum))
+	var blockHash *common.Hash
+	data, err := s.db.Get(key)
+	if err == nil {
+		var blockHashDBVal blockHashDBValue
+		err = rlp.DecodeBytes(data, &blockHashDBVal)
+		if err != nil {
+			return nil, err
+		}
+		blockHash = blockHashDBVal.BlockHash
+	} else if !dbutil.IsErrNotFound(err) {
+		return nil, err
+	}
+
+	blockMetadata, err := s.BlockMetadataAtCount(seqNum + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	msgWithBlockInfo := arbostypes.MessageWithMetadataAndBlockInfo{
+		MessageWithMeta: *msg,
+		BlockHash:       blockHash,
+		BlockMetadata:   blockMetadata,
+	}
+	return &msgWithBlockInfo, nil
 }
 
 // Note: if changed to acquire the mutex, some internal users may need to be updated to a non-locking version.
@@ -421,16 +534,31 @@ func (s *TransactionStreamer) GetProcessedMessageCount() (arbutil.MessageIndex, 
 	return msgCount, nil
 }
 
-func (s *TransactionStreamer) AddMessages(pos arbutil.MessageIndex, messagesAreConfirmed bool, messages []arbostypes.MessageWithMetadata) error {
-	return s.AddMessagesAndEndBatch(pos, messagesAreConfirmed, messages, nil)
+func (s *TransactionStreamer) AddMessages(pos arbutil.MessageIndex, messagesAreConfirmed bool, messages []arbostypes.MessageWithMetadata, blockMetadataArr []common.BlockMetadata) error {
+	return s.AddMessagesAndEndBatch(pos, messagesAreConfirmed, messages, blockMetadataArr, nil)
 }
 
-func (s *TransactionStreamer) AddBroadcastMessages(feedMessages []*broadcaster.BroadcastFeedMessage) error {
+func (s *TransactionStreamer) FeedPendingMessageCount() arbutil.MessageIndex {
+	pos := s.broadcasterQueuedMessagesPos.Load()
+	if pos == 0 {
+		return 0
+	}
+
+	s.insertionMutex.Lock()
+	defer s.insertionMutex.Unlock()
+	pos = s.broadcasterQueuedMessagesPos.Load()
+	if pos == 0 {
+		return 0
+	}
+	return arbutil.MessageIndex(pos + uint64(len(s.broadcasterQueuedMessages)))
+}
+
+func (s *TransactionStreamer) AddBroadcastMessages(feedMessages []*m.BroadcastFeedMessage) error {
 	if len(feedMessages) == 0 {
 		return nil
 	}
 	broadcastStartPos := feedMessages[0].SequenceNumber
-	var messages []arbostypes.MessageWithMetadata
+	var messages []arbostypes.MessageWithMetadataAndBlockInfo
 	broadcastAfterPos := broadcastStartPos
 	for _, feedMessage := range feedMessages {
 		if broadcastAfterPos != feedMessage.SequenceNumber {
@@ -439,7 +567,12 @@ func (s *TransactionStreamer) AddBroadcastMessages(feedMessages []*broadcaster.B
 		if feedMessage.Message.Message == nil || feedMessage.Message.Message.Header == nil {
 			return fmt.Errorf("invalid feed message at sequence number %v", feedMessage.SequenceNumber)
 		}
-		messages = append(messages, feedMessage.Message)
+		msgWithBlockInfo := arbostypes.MessageWithMetadataAndBlockInfo{
+			MessageWithMeta: feedMessage.Message,
+			BlockHash:       feedMessage.BlockHash,
+			BlockMetadata:   feedMessage.BlockMetadata,
+		}
+		messages = append(messages, msgWithBlockInfo)
 		broadcastAfterPos++
 	}
 
@@ -458,7 +591,7 @@ func (s *TransactionStreamer) AddBroadcastMessages(feedMessages []*broadcaster.B
 	messages = messages[dups:]
 	broadcastStartPos += arbutil.MessageIndex(dups)
 	if oldMsg != nil {
-		s.logReorg(broadcastStartPos, oldMsg, &messages[0], false)
+		s.logReorg(broadcastStartPos, oldMsg, &messages[0].MessageWithMeta, false)
 	}
 	if len(messages) == 0 {
 		// No new messages received
@@ -468,14 +601,14 @@ func (s *TransactionStreamer) AddBroadcastMessages(feedMessages []*broadcaster.B
 	if len(s.broadcasterQueuedMessages) == 0 || (feedReorg && !s.broadcasterQueuedMessagesActiveReorg) {
 		// Empty cache or feed different from database, save current feed messages until confirmed L1 messages catch up.
 		s.broadcasterQueuedMessages = messages
-		atomic.StoreUint64(&s.broadcasterQueuedMessagesPos, uint64(broadcastStartPos))
+		s.broadcasterQueuedMessagesPos.Store(uint64(broadcastStartPos))
 		s.broadcasterQueuedMessagesActiveReorg = feedReorg
 	} else {
-		broadcasterQueuedMessagesPos := arbutil.MessageIndex(atomic.LoadUint64(&s.broadcasterQueuedMessagesPos))
+		broadcasterQueuedMessagesPos := arbutil.MessageIndex(s.broadcasterQueuedMessagesPos.Load())
 		if broadcasterQueuedMessagesPos >= broadcastStartPos {
 			// Feed messages older than cache
 			s.broadcasterQueuedMessages = messages
-			atomic.StoreUint64(&s.broadcasterQueuedMessagesPos, uint64(broadcastStartPos))
+			s.broadcasterQueuedMessagesPos.Store(uint64(broadcastStartPos))
 			s.broadcasterQueuedMessagesActiveReorg = feedReorg
 		} else if broadcasterQueuedMessagesPos+arbutil.MessageIndex(len(s.broadcasterQueuedMessages)) == broadcastStartPos {
 			// Feed messages can be added directly to end of cache
@@ -495,7 +628,7 @@ func (s *TransactionStreamer) AddBroadcastMessages(feedMessages []*broadcaster.B
 				)
 			}
 			s.broadcasterQueuedMessages = messages
-			atomic.StoreUint64(&s.broadcasterQueuedMessagesPos, uint64(broadcastStartPos))
+			s.broadcasterQueuedMessagesPos.Store(uint64(broadcastStartPos))
 			s.broadcasterQueuedMessagesActiveReorg = feedReorg
 		}
 	}
@@ -508,7 +641,7 @@ func (s *TransactionStreamer) AddBroadcastMessages(feedMessages []*broadcaster.B
 	if broadcastStartPos > 0 {
 		_, err := s.GetMessage(broadcastStartPos - 1)
 		if err != nil {
-			if !errors.Is(err, leveldb.ErrNotFound) {
+			if !dbutil.IsErrNotFound(err) {
 				return err
 			}
 			// Message before current message doesn't exist in database, so don't add current messages yet
@@ -530,7 +663,8 @@ func (s *TransactionStreamer) AddFakeInitMessage() error {
 	if err != nil {
 		return fmt.Errorf("failed to serialize chain config: %w", err)
 	}
-	msg := append(append(math.U256Bytes(s.chainConfig.ChainID), 0), chainConfigJson...)
+	chainIdBytes := arbmath.U256Bytes(s.chainConfig.ChainID)
+	msg := append(append(chainIdBytes, 0), chainConfigJson...)
 	return s.AddMessages(0, false, []arbostypes.MessageWithMetadata{{
 		Message: &arbostypes.L1IncomingMessage{
 			Header: &arbostypes.L1IncomingMessageHeader{
@@ -541,7 +675,7 @@ func (s *TransactionStreamer) AddFakeInitMessage() error {
 			L2msg: msg,
 		},
 		DelayedMessagesRead: 1,
-	}})
+	}}, nil)
 }
 
 // Used in redis tests
@@ -558,15 +692,32 @@ func endBatch(batch ethdb.Batch) error {
 	return batch.Write()
 }
 
-func (s *TransactionStreamer) AddMessagesAndEndBatch(pos arbutil.MessageIndex, messagesAreConfirmed bool, messages []arbostypes.MessageWithMetadata, batch ethdb.Batch) error {
+func (s *TransactionStreamer) AddMessagesAndEndBatch(pos arbutil.MessageIndex, messagesAreConfirmed bool, messages []arbostypes.MessageWithMetadata, blockMetadataArr []common.BlockMetadata, batch ethdb.Batch) error {
+	messagesWithBlockInfo := make([]arbostypes.MessageWithMetadataAndBlockInfo, 0, len(messages))
+	for _, message := range messages {
+		messagesWithBlockInfo = append(messagesWithBlockInfo, arbostypes.MessageWithMetadataAndBlockInfo{
+			MessageWithMeta: message,
+		})
+	}
+
+	if len(blockMetadataArr) == len(messagesWithBlockInfo) {
+		for i, blockMetadata := range blockMetadataArr {
+			messagesWithBlockInfo[i].BlockMetadata = blockMetadata
+		}
+	} else if len(blockMetadataArr) > 0 {
+		return fmt.Errorf("size of blockMetadata array doesn't match the size of messages array. lockMetadataArrSize: %d, messagesSize: %d", len(blockMetadataArr), len(messages))
+	}
+
 	if messagesAreConfirmed {
+		// Trim confirmed messages from l1pricedataCache
+		s.exec.MarkFeedStart(pos + arbutil.MessageIndex(len(messages)))
 		s.reorgMutex.RLock()
-		dups, _, _, err := s.countDuplicateMessages(pos, messages, nil)
+		dups, _, _, err := s.countDuplicateMessages(pos, messagesWithBlockInfo, nil)
 		s.reorgMutex.RUnlock()
 		if err != nil {
 			return err
 		}
-		if dups == len(messages) {
+		if dups == uint64(len(messages)) {
 			return endBatch(batch)
 		}
 		// cant keep reorg lock when catching insertionMutex.
@@ -578,10 +729,13 @@ func (s *TransactionStreamer) AddMessagesAndEndBatch(pos arbutil.MessageIndex, m
 	s.insertionMutex.Lock()
 	defer s.insertionMutex.Unlock()
 
-	return s.addMessagesAndEndBatchImpl(pos, messagesAreConfirmed, messages, batch)
+	return s.addMessagesAndEndBatchImpl(pos, messagesAreConfirmed, messagesWithBlockInfo, batch)
 }
 
 func (s *TransactionStreamer) getPrevPrevDelayedRead(pos arbutil.MessageIndex) (uint64, error) {
+	if s.snapSyncConfig.Enabled && uint64(pos) == s.snapSyncConfig.PrevBatchMessageCount {
+		return s.snapSyncConfig.PrevDelayedRead, nil
+	}
 	var prevDelayedRead uint64
 	if pos > 0 {
 		prevMsg, err := s.GetMessage(pos - 1)
@@ -596,12 +750,12 @@ func (s *TransactionStreamer) getPrevPrevDelayedRead(pos arbutil.MessageIndex) (
 
 func (s *TransactionStreamer) countDuplicateMessages(
 	pos arbutil.MessageIndex,
-	messages []arbostypes.MessageWithMetadata,
+	messages []arbostypes.MessageWithMetadataAndBlockInfo,
 	batch *ethdb.Batch,
-) (int, bool, *arbostypes.MessageWithMetadata, error) {
-	curMsg := 0
+) (uint64, bool, *arbostypes.MessageWithMetadata, error) {
+	var curMsg uint64
 	for {
-		if len(messages) == curMsg {
+		if uint64(len(messages)) == curMsg {
 			break
 		}
 		key := dbKey(messagePrefix, uint64(pos))
@@ -617,7 +771,7 @@ func (s *TransactionStreamer) countDuplicateMessages(
 			return 0, false, nil, err
 		}
 		nextMessage := messages[curMsg]
-		wantMessage, err := rlp.EncodeToBytes(nextMessage)
+		wantMessage, err := rlp.EncodeToBytes(nextMessage.MessageWithMeta)
 		if err != nil {
 			return 0, false, nil, err
 		}
@@ -633,12 +787,12 @@ func (s *TransactionStreamer) countDuplicateMessages(
 				return curMsg, true, nil, nil
 			}
 			var duplicateMessage bool
-			if nextMessage.Message != nil {
-				if dbMessageParsed.Message.BatchGasCost == nil || nextMessage.Message.BatchGasCost == nil {
+			if nextMessage.MessageWithMeta.Message != nil {
+				if dbMessageParsed.Message.BatchGasCost == nil || nextMessage.MessageWithMeta.Message.BatchGasCost == nil {
 					// Remove both of the batch gas costs and see if the messages still differ
-					nextMessageCopy := nextMessage
+					nextMessageCopy := nextMessage.MessageWithMeta
 					nextMessageCopy.Message = new(arbostypes.L1IncomingMessage)
-					*nextMessageCopy.Message = *nextMessage.Message
+					*nextMessageCopy.Message = *nextMessage.MessageWithMeta.Message
 					batchGasCostBkup := dbMessageParsed.Message.BatchGasCost
 					dbMessageParsed.Message.BatchGasCost = nil
 					nextMessageCopy.Message.BatchGasCost = nil
@@ -646,7 +800,7 @@ func (s *TransactionStreamer) countDuplicateMessages(
 						// Actually this isn't a reorg; only the batch gas costs differed
 						duplicateMessage = true
 						// If possible - update the message in the database to add the gas cost cache.
-						if batch != nil && nextMessage.Message.BatchGasCost != nil {
+						if batch != nil && nextMessage.MessageWithMeta.Message.BatchGasCost != nil {
 							if *batch == nil {
 								*batch = s.db.NewBatch()
 							}
@@ -690,24 +844,25 @@ func (s *TransactionStreamer) logReorg(pos arbutil.MessageIndex, dbMsg *arbostyp
 
 }
 
-func (s *TransactionStreamer) addMessagesAndEndBatchImpl(messageStartPos arbutil.MessageIndex, messagesAreConfirmed bool, messages []arbostypes.MessageWithMetadata, batch ethdb.Batch) error {
+func (s *TransactionStreamer) addMessagesAndEndBatchImpl(messageStartPos arbutil.MessageIndex, messagesAreConfirmed bool, messages []arbostypes.MessageWithMetadataAndBlockInfo, batch ethdb.Batch) error {
 	var confirmedReorg bool
 	var oldMsg *arbostypes.MessageWithMetadata
 	var lastDelayedRead uint64
 	var hasNewConfirmedMessages bool
+	var cacheClearLen int
 
 	messagesAfterPos := messageStartPos + arbutil.MessageIndex(len(messages))
-	broadcastStartPos := arbutil.MessageIndex(atomic.LoadUint64(&s.broadcasterQueuedMessagesPos))
+	broadcastStartPos := arbutil.MessageIndex(s.broadcasterQueuedMessagesPos.Load())
 
 	if messagesAreConfirmed {
-		var duplicates int
+		var duplicates uint64
 		var err error
 		duplicates, confirmedReorg, oldMsg, err = s.countDuplicateMessages(messageStartPos, messages, &batch)
 		if err != nil {
 			return err
 		}
 		if duplicates > 0 {
-			lastDelayedRead = messages[duplicates-1].DelayedMessagesRead
+			lastDelayedRead = messages[duplicates-1].MessageWithMeta.DelayedMessagesRead
 			messages = messages[duplicates:]
 			messageStartPos += arbutil.MessageIndex(duplicates)
 		}
@@ -722,11 +877,15 @@ func (s *TransactionStreamer) addMessagesAndEndBatchImpl(messageStartPos arbutil
 		// Active broadcast reorg and L1 messages at or before start of broadcast messages
 		// Or no active broadcast reorg and broadcast messages start before or immediately after last L1 message
 		if messagesAfterPos >= broadcastStartPos {
+			// #nosec G115
 			broadcastSliceIndex := int(messagesAfterPos - broadcastStartPos)
+			messagesOldLen := len(messages)
 			if broadcastSliceIndex < len(s.broadcasterQueuedMessages) {
 				// Some cached feed messages can be used
 				messages = append(messages, s.broadcasterQueuedMessages[broadcastSliceIndex:]...)
 			}
+			// This calculation gives the exact length of cache which was appended to messages
+			cacheClearLen = broadcastSliceIndex + len(messages) - messagesOldLen
 		}
 
 		// L1 used or replaced broadcast cache items
@@ -735,20 +894,20 @@ func (s *TransactionStreamer) addMessagesAndEndBatchImpl(messageStartPos arbutil
 
 	var feedReorg bool
 	if !hasNewConfirmedMessages {
-		var duplicates int
+		var duplicates uint64
 		var err error
 		duplicates, feedReorg, oldMsg, err = s.countDuplicateMessages(messageStartPos, messages, nil)
 		if err != nil {
 			return err
 		}
 		if duplicates > 0 {
-			lastDelayedRead = messages[duplicates-1].DelayedMessagesRead
+			lastDelayedRead = messages[duplicates-1].MessageWithMeta.DelayedMessagesRead
 			messages = messages[duplicates:]
 			messageStartPos += arbutil.MessageIndex(duplicates)
 		}
 	}
 	if oldMsg != nil {
-		s.logReorg(messageStartPos, oldMsg, &messages[0], confirmedReorg)
+		s.logReorg(messageStartPos, oldMsg, &messages[0].MessageWithMeta, confirmedReorg)
 	}
 
 	if feedReorg {
@@ -767,13 +926,14 @@ func (s *TransactionStreamer) addMessagesAndEndBatchImpl(messageStartPos arbutil
 
 	// Validate delayed message counts of remaining messages
 	for i, msg := range messages {
+		// #nosec G115
 		msgPos := messageStartPos + arbutil.MessageIndex(i)
-		diff := msg.DelayedMessagesRead - lastDelayedRead
+		diff := msg.MessageWithMeta.DelayedMessagesRead - lastDelayedRead
 		if diff != 0 && diff != 1 {
-			return fmt.Errorf("attempted to insert jump from %v delayed messages read to %v delayed messages read at message index %v", lastDelayedRead, msg.DelayedMessagesRead, msgPos)
+			return fmt.Errorf("attempted to insert jump from %v delayed messages read to %v delayed messages read at message index %v", lastDelayedRead, msg.MessageWithMeta.DelayedMessagesRead, msgPos)
 		}
-		lastDelayedRead = msg.DelayedMessagesRead
-		if msg.Message == nil {
+		lastDelayedRead = msg.MessageWithMeta.DelayedMessagesRead
+		if msg.MessageWithMeta.Message == nil {
 			return fmt.Errorf("attempted to insert nil message at position %v", msgPos)
 		}
 	}
@@ -799,16 +959,19 @@ func (s *TransactionStreamer) addMessagesAndEndBatchImpl(messageStartPos arbutil
 	}
 
 	if clearQueueOnSuccess {
-		s.broadcasterQueuedMessages = s.broadcasterQueuedMessages[:0]
-		atomic.StoreUint64(&s.broadcasterQueuedMessagesPos, 0)
+		// Check if new messages were added at the end of cache, if they were, then dont remove those particular messages
+		if len(s.broadcasterQueuedMessages) > cacheClearLen {
+			s.broadcasterQueuedMessages = s.broadcasterQueuedMessages[cacheClearLen:]
+			// #nosec G115
+			s.broadcasterQueuedMessagesPos.Store(uint64(broadcastStartPos) + uint64(cacheClearLen))
+		} else {
+			s.broadcasterQueuedMessages = s.broadcasterQueuedMessages[:0]
+			s.broadcasterQueuedMessagesPos.Store(0)
+		}
 		s.broadcasterQueuedMessagesActiveReorg = false
 	}
 
 	return nil
-}
-
-func (s *TransactionStreamer) FetchBatch(batchNum uint64) ([]byte, error) {
-	return s.inboxReader.GetSequencerMessageBytes(context.TODO(), batchNum)
 }
 
 // The caller must hold the insertionMutex
@@ -821,7 +984,12 @@ func (s *TransactionStreamer) ExpectChosenSequencer() error {
 	return nil
 }
 
-func (s *TransactionStreamer) WriteMessageFromSequencer(pos arbutil.MessageIndex, msgWithMeta arbostypes.MessageWithMetadata) error {
+func (s *TransactionStreamer) WriteMessageFromSequencer(
+	pos arbutil.MessageIndex,
+	msgWithMeta arbostypes.MessageWithMetadata,
+	msgResult execution.MessageResult,
+	blockMetadata common.BlockMetadata,
+) error {
 	if err := s.ExpectChosenSequencer(); err != nil {
 		return err
 	}
@@ -840,26 +1008,26 @@ func (s *TransactionStreamer) WriteMessageFromSequencer(pos arbutil.MessageIndex
 	}
 
 	if s.coordinator != nil {
-		if err := s.coordinator.SequencingMessage(pos, &msgWithMeta); err != nil {
+		if err := s.coordinator.SequencingMessage(pos, &msgWithMeta, blockMetadata); err != nil {
 			return err
 		}
 	}
 
-	if err := s.writeMessages(pos, []arbostypes.MessageWithMetadata{msgWithMeta}, nil); err != nil {
+	msgWithBlockInfo := arbostypes.MessageWithMetadataAndBlockInfo{
+		MessageWithMeta: msgWithMeta,
+		BlockHash:       &msgResult.BlockHash,
+		BlockMetadata:   blockMetadata,
+	}
+
+	if err := s.writeMessages(pos, []arbostypes.MessageWithMetadataAndBlockInfo{msgWithBlockInfo}, nil); err != nil {
 		return err
 	}
-
-	if s.broadcastServer != nil {
-		if err := s.broadcastServer.BroadcastSingle(msgWithMeta, pos); err != nil {
-			log.Error("failed broadcasting message", "pos", pos, "err", err)
-		}
+	if s.trackBlockMetadataFrom == 0 || pos < s.trackBlockMetadataFrom {
+		msgWithBlockInfo.BlockMetadata = nil
 	}
+	s.broadcastMessages([]arbostypes.MessageWithMetadataAndBlockInfo{msgWithBlockInfo}, pos)
 
 	return nil
-}
-
-func (s *TransactionStreamer) GenesisBlockNumber() uint64 {
-	return s.chainConfig.ArbitrumChainParams.GenesisBlockNum
 }
 
 // PauseReorgs until a matching call to ResumeReorgs (may be called concurrently)
@@ -878,22 +1046,73 @@ func (s *TransactionStreamer) PopulateFeedBacklog() error {
 	return s.inboxReader.tracker.PopulateFeedBacklog(s.broadcastServer)
 }
 
-func (s *TransactionStreamer) writeMessage(pos arbutil.MessageIndex, msg arbostypes.MessageWithMetadata, batch ethdb.Batch) error {
+func (s *TransactionStreamer) writeMessage(pos arbutil.MessageIndex, msg arbostypes.MessageWithMetadataAndBlockInfo, batch ethdb.Batch) error {
+	// write message with metadata
 	key := dbKey(messagePrefix, uint64(pos))
-	msgBytes, err := rlp.EncodeToBytes(msg)
+	msgBytes, err := rlp.EncodeToBytes(msg.MessageWithMeta)
 	if err != nil {
 		return err
 	}
-	return batch.Put(key, msgBytes)
+	if err := batch.Put(key, msgBytes); err != nil {
+		return err
+	}
+
+	// write block hash
+	blockHashDBVal := blockHashDBValue{
+		BlockHash: msg.BlockHash,
+	}
+	key = dbKey(blockHashInputFeedPrefix, uint64(pos))
+	msgBytes, err = rlp.EncodeToBytes(blockHashDBVal)
+	if err != nil {
+		return err
+	}
+	if err := batch.Put(key, msgBytes); err != nil {
+		return err
+	}
+
+	if s.trackBlockMetadataFrom != 0 && pos >= s.trackBlockMetadataFrom {
+		if msg.BlockMetadata != nil {
+			// Only store non-nil BlockMetadata to db. In case of a reorg, we dont have to explicitly
+			// clear out BlockMetadata of the reorged message, since those messages will be handled by s.reorg()
+			// This also allows update of BatchGasCost in message without mistakenly erasing BlockMetadata
+			key = dbKey(blockMetadataInputFeedPrefix, uint64(pos))
+			return batch.Put(key, msg.BlockMetadata)
+		} else {
+			// Mark that blockMetadata is missing only if it isn't already present. This check prevents unnecessary marking
+			// when updating BatchGasCost or when adding messages from seq-coordinator redis that doesn't have block metadata
+			prevBlockMetadata, err := s.BlockMetadataAtCount(pos + 1)
+			if err != nil {
+				return err
+			}
+			if prevBlockMetadata == nil {
+				key = dbKey(missingBlockMetadataInputFeedPrefix, uint64(pos))
+				return batch.Put(key, nil)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *TransactionStreamer) broadcastMessages(
+	msgs []arbostypes.MessageWithMetadataAndBlockInfo,
+	pos arbutil.MessageIndex,
+) {
+	if s.broadcastServer == nil {
+		return
+	}
+	if err := s.broadcastServer.BroadcastMessages(msgs, pos); err != nil {
+		log.Error("failed broadcasting messages", "pos", pos, "err", err)
+	}
 }
 
 // The mutex must be held, and pos must be the latest message count.
 // `batch` may be nil, which initializes a new batch. The batch is closed out in this function.
-func (s *TransactionStreamer) writeMessages(pos arbutil.MessageIndex, messages []arbostypes.MessageWithMetadata, batch ethdb.Batch) error {
+func (s *TransactionStreamer) writeMessages(pos arbutil.MessageIndex, messages []arbostypes.MessageWithMetadataAndBlockInfo, batch ethdb.Batch) error {
 	if batch == nil {
 		batch = s.db.NewBatch()
 	}
 	for i, msg := range messages {
+		// #nosec G115
 		err := s.writeMessage(pos+arbutil.MessageIndex(i), msg, batch)
 		if err != nil {
 			return err
@@ -917,16 +1136,112 @@ func (s *TransactionStreamer) writeMessages(pos arbutil.MessageIndex, messages [
 	return nil
 }
 
-// TODO: eventually there will be a table maintained by txStreamer itself
+func (s *TransactionStreamer) BlockMetadataAtCount(count arbutil.MessageIndex) (common.BlockMetadata, error) {
+	if count == 0 {
+		return nil, nil
+	}
+	pos := count - 1
+
+	if s.trackBlockMetadataFrom == 0 || pos < s.trackBlockMetadataFrom {
+		return nil, nil
+	}
+
+	key := dbKey(blockMetadataInputFeedPrefix, uint64(pos))
+	blockMetadata, err := s.db.Get(key)
+	if err != nil {
+		if dbutil.IsErrNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return blockMetadata, nil
+}
+
 func (s *TransactionStreamer) ResultAtCount(count arbutil.MessageIndex) (*execution.MessageResult, error) {
 	if count == 0 {
 		return &execution.MessageResult{}, nil
 	}
-	return s.exec.ResultAtPos(count - 1)
+	pos := count - 1
+
+	key := dbKey(messageResultPrefix, uint64(pos))
+	data, err := s.db.Get(key)
+	if err == nil {
+		var msgResult execution.MessageResult
+		err = rlp.DecodeBytes(data, &msgResult)
+		if err == nil {
+			return &msgResult, nil
+		}
+	} else if !dbutil.IsErrNotFound(err) {
+		return nil, err
+	}
+	log.Info(FailedToGetMsgResultFromDB, "count", count)
+
+	msgResult, err := s.exec.ResultAtPos(pos)
+	if err != nil {
+		return nil, err
+	}
+	// Stores result in Consensus DB in a best-effort manner
+	batch := s.db.NewBatch()
+	err = s.storeResult(pos, *msgResult, batch)
+	if err != nil {
+		log.Warn("Failed to store result at ResultAtCount", "err", err)
+		return msgResult, nil
+	}
+	err = batch.Write()
+	if err != nil {
+		log.Warn("Failed to store result at ResultAtCount", "err", err)
+		return msgResult, nil
+	}
+
+	return msgResult, nil
 }
 
+func (s *TransactionStreamer) checkResult(pos arbutil.MessageIndex, msgResult *execution.MessageResult, msgAndBlockInfo *arbostypes.MessageWithMetadataAndBlockInfo) {
+	if msgAndBlockInfo.BlockHash == nil {
+		return
+	}
+	if msgResult.BlockHash != *msgAndBlockInfo.BlockHash {
+		log.Error(
+			BlockHashMismatchLogMsg,
+			"expected", msgAndBlockInfo.BlockHash,
+			"actual", msgResult.BlockHash,
+		)
+		// Try deleting the existing blockMetadata for this block in arbDB and set it as missing
+		if msgAndBlockInfo.BlockMetadata != nil {
+			batch := s.db.NewBatch()
+			if err := batch.Delete(dbKey(blockMetadataInputFeedPrefix, uint64(pos))); err != nil {
+				log.Error("error deleting blockMetadata of block whose BlockHash from feed doesn't match locally computed hash", "msgSeqNum", pos, "err", err)
+				return
+			}
+			if s.trackBlockMetadataFrom != 0 && pos >= s.trackBlockMetadataFrom {
+				if err := batch.Put(dbKey(missingBlockMetadataInputFeedPrefix, uint64(pos)), nil); err != nil {
+					log.Error("error marking deleted blockMetadata as missing in arbDB for a block whose BlockHash from feed doesn't match locally computed hash", "msgSeqNum", pos, "err", err)
+					return
+				}
+			}
+			if err := batch.Write(); err != nil {
+				log.Error("error writing batch that deletes blockMetadata of the block whose BlockHash from feed doesn't match locally computed hash", "msgSeqNum", pos, "err", err)
+			}
+		}
+	}
+}
+
+func (s *TransactionStreamer) storeResult(
+	pos arbutil.MessageIndex,
+	msgResult execution.MessageResult,
+	batch ethdb.Batch,
+) error {
+	msgResultBytes, err := rlp.EncodeToBytes(msgResult)
+	if err != nil {
+		return err
+	}
+	key := dbKey(messageResultPrefix, uint64(pos))
+	return batch.Put(key, msgResultBytes)
+}
+
+// exposed for testing
 // return value: true if should be called again immediately
-func (s *TransactionStreamer) executeNextMsg(ctx context.Context, exec *execution.ExecutionEngine) bool {
+func (s *TransactionStreamer) ExecuteNextMsg(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return false
 	}
@@ -950,12 +1265,21 @@ func (s *TransactionStreamer) executeNextMsg(ctx context.Context, exec *executio
 	if pos >= msgCount {
 		return false
 	}
-	msg, err := s.GetMessage(pos)
+	msgAndBlockInfo, err := s.getMessageWithMetadataAndBlockInfo(pos)
 	if err != nil {
 		log.Error("feedOneMsg failed to readMessage", "err", err, "pos", pos)
 		return false
 	}
-	err = s.exec.DigestMessage(pos, msg)
+	var msgForPrefetch *arbostypes.MessageWithMetadata
+	if pos+1 < msgCount {
+		msg, err := s.GetMessage(pos + 1)
+		if err != nil {
+			log.Error("feedOneMsg failed to readMessage", "err", err, "pos", pos+1)
+			return false
+		}
+		msgForPrefetch = msg
+	}
+	msgResult, err := s.exec.DigestMessage(pos, &msgAndBlockInfo.MessageWithMeta, msgForPrefetch)
 	if err != nil {
 		logger := log.Warn
 		if prevMessageCount < msgCount {
@@ -964,11 +1288,33 @@ func (s *TransactionStreamer) executeNextMsg(ctx context.Context, exec *executio
 		logger("feedOneMsg failed to send message to execEngine", "err", err, "pos", pos)
 		return false
 	}
+
+	s.checkResult(pos, msgResult, msgAndBlockInfo)
+
+	batch := s.db.NewBatch()
+	err = s.storeResult(pos, *msgResult, batch)
+	if err != nil {
+		log.Error("feedOneMsg failed to store result", "err", err)
+		return false
+	}
+	err = batch.Write()
+	if err != nil {
+		log.Error("feedOneMsg failed to store result", "err", err)
+		return false
+	}
+
+	msgWithBlockInfo := arbostypes.MessageWithMetadataAndBlockInfo{
+		MessageWithMeta: msgAndBlockInfo.MessageWithMeta,
+		BlockHash:       &msgResult.BlockHash,
+		BlockMetadata:   msgAndBlockInfo.BlockMetadata,
+	}
+	s.broadcastMessages([]arbostypes.MessageWithMetadataAndBlockInfo{msgWithBlockInfo}, pos)
+
 	return pos+1 < msgCount
 }
 
 func (s *TransactionStreamer) executeMessages(ctx context.Context, ignored struct{}) time.Duration {
-	if s.executeNextMsg(ctx, s.exec) {
+	if s.ExecuteNextMsg(ctx) {
 		return 0
 	}
 	return s.config().ExecuteMessageLoopDelay

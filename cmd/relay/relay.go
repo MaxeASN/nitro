@@ -6,7 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,10 +21,6 @@ import (
 	"github.com/offchainlabs/nitro/cmd/util/confighelpers"
 	"github.com/offchainlabs/nitro/relay"
 )
-
-func init() {
-	http.DefaultServeMux = http.NewServeMux()
-}
 
 func main() {
 	if err := startup(); err != nil {
@@ -67,16 +63,20 @@ func startup() error {
 		confighelpers.PrintErrorAndExit(err, printSampleUsage)
 	}
 
-	logFormat, err := genericconf.ParseLogType(relayConfig.LogType)
+	handler, err := genericconf.HandlerFromLogType(relayConfig.LogType, io.Writer(os.Stderr))
 	if err != nil {
 		flag.Usage()
-		panic(fmt.Sprintf("Error parsing log type: %v", err))
+		return fmt.Errorf("error parsing log type when creating handler: %w", err)
 	}
-	glogger := log.NewGlogHandler(log.StreamHandler(os.Stderr, logFormat))
-	glogger.Verbosity(log.Lvl(relayConfig.LogLevel))
-	log.Root().SetHandler(glogger)
+	logLevel, err := genericconf.ToSlogLevel(relayConfig.LogLevel)
+	if err != nil {
+		confighelpers.PrintErrorAndExit(err, printSampleUsage)
+	}
+	glogger := log.NewGlogHandler(handler)
+	glogger.Verbosity(logLevel)
+	log.SetDefault(log.NewLogger(glogger))
 
-	vcsRevision, vcsTime := confighelpers.GetVersion()
+	vcsRevision, _, vcsTime := confighelpers.GetVersion()
 	log.Info("Running Arbitrum nitro relay", "revision", vcsRevision, "vcs.time", vcsTime)
 
 	defer log.Info("Cleanly shutting down relay")

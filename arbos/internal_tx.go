@@ -1,4 +1,4 @@
-// Copyright 2021-2022, Offchain Labs, Inc.
+// Copyright 2021-2024, Offchain Labs, Inc.
 // For license information, see https://github.com/nitro/blob/master/LICENSE
 
 package arbos
@@ -8,15 +8,15 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/offchainlabs/nitro/util/arbmath"
-
-	"github.com/ethereum/go-ethereum/log"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
+
 	"github.com/offchainlabs/nitro/arbos/arbosState"
 	"github.com/offchainlabs/nitro/arbos/util"
+	"github.com/offchainlabs/nitro/util/arbmath"
 )
 
 func InternalTxStartBlock(
@@ -57,11 +57,11 @@ func ApplyInternalTxUpdate(tx *types.ArbitrumInternalTx, state *arbosState.Arbos
 
 		l1BlockNumber := util.SafeMapGet[uint64](inputs, "l1BlockNumber")
 		timePassed := util.SafeMapGet[uint64](inputs, "timePassed")
-		if state.ArbOSVersion() < 3 {
+		if state.ArbOSVersion() < params.ArbosVersion_3 {
 			// (incorrectly) use the L2 block number instead
 			timePassed = util.SafeMapGet[uint64](inputs, "l2BlockNumber")
 		}
-		if state.ArbOSVersion() < 8 {
+		if state.ArbOSVersion() < params.ArbosVersion_8 {
 			// in old versions we incorrectly used an L1 block number one too high
 			l1BlockNumber++
 		}
@@ -104,8 +104,8 @@ func ApplyInternalTxUpdate(tx *types.ArbitrumInternalTx, state *arbosState.Arbos
 		if err != nil {
 			log.Warn("L1Pricing PerBatchGas failed", "err", err)
 		}
-		gasSpent := arbmath.SaturatingAdd(perBatchGas, arbmath.SaturatingCast(batchDataGas))
-		weiSpent := arbmath.BigMulByUint(l1BaseFeeWei, arbmath.SaturatingUCast(gasSpent))
+		gasSpent := arbmath.SaturatingAdd(perBatchGas, arbmath.SaturatingCast[int64](batchDataGas))
+		weiSpent := arbmath.BigMulByUint(l1BaseFeeWei, arbmath.SaturatingUCast[uint64](gasSpent))
 		err = l1p.UpdateForBatchPosterSpending(
 			evm.StateDB,
 			evm,

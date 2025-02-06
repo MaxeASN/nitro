@@ -8,6 +8,8 @@ import (
 	"errors"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/params"
+
 	"github.com/offchainlabs/nitro/arbos/storage"
 )
 
@@ -21,7 +23,7 @@ func InitializeBlockhashes(backingStorage *storage.Storage) {
 }
 
 func OpenBlockhashes(backingStorage *storage.Storage) *Blockhashes {
-	return &Blockhashes{backingStorage, backingStorage.OpenStorageBackedUint64(0)}
+	return &Blockhashes{backingStorage.WithoutCache(), backingStorage.OpenStorageBackedUint64(0)}
 }
 
 func (bh *Blockhashes) L1BlockNumber() (uint64, error) {
@@ -55,7 +57,7 @@ func (bh *Blockhashes) RecordNewL1Block(number uint64, blockHash common.Hash, ar
 		// fill in hashes for any "skipped over" blocks
 		nextNumber++
 		var nextNumBuf [8]byte
-		if arbosVersion >= 8 {
+		if arbosVersion >= params.ArbosVersion_8 {
 			binary.LittleEndian.PutUint64(nextNumBuf[:], nextNumber)
 		}
 

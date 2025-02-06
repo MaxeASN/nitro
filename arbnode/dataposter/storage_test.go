@@ -1,3 +1,6 @@
+// Copyright 2021-2023, Offchain Labs, Inc.
+// For license information, see https://github.com/nitro/blob/master/LICENSE
+
 package dataposter
 
 import (
@@ -6,16 +9,19 @@ import (
 	"path"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/offchainlabs/nitro/arbnode/dataposter/leveldb"
+
+	"github.com/offchainlabs/nitro/arbnode/dataposter/dbstorage"
 	"github.com/offchainlabs/nitro/arbnode/dataposter/redis"
 	"github.com/offchainlabs/nitro/arbnode/dataposter/slice"
 	"github.com/offchainlabs/nitro/arbnode/dataposter/storage"
+	"github.com/offchainlabs/nitro/cmd/conf"
 	"github.com/offchainlabs/nitro/util/arbmath"
 	"github.com/offchainlabs/nitro/util/redisutil"
 	"github.com/offchainlabs/nitro/util/signature"
@@ -30,13 +36,22 @@ var ignoreData = cmp.Options{
 	cmpopts.IgnoreFields(types.Transaction{}, "hash", "size", "from"),
 }
 
-func newLevelDBStorage(t *testing.T, encF storage.EncoderDecoderF) *leveldb.Storage {
+func newLevelDBStorage(t *testing.T, encF storage.EncoderDecoderF) *dbstorage.Storage {
 	t.Helper()
 	db, err := rawdb.NewLevelDBDatabase(path.Join(t.TempDir(), "level.db"), 0, 0, "default", false)
 	if err != nil {
 		t.Fatalf("NewLevelDBDatabase() unexpected error: %v", err)
 	}
-	return leveldb.New(db, encF)
+	return dbstorage.New(db, encF)
+}
+
+func newPebbleDBStorage(t *testing.T, encF storage.EncoderDecoderF) *dbstorage.Storage {
+	t.Helper()
+	db, err := rawdb.NewPebbleDBDatabase(path.Join(t.TempDir(), "pebble.db"), 0, 0, "default", false, true, conf.PersistentConfigDefault.Pebble.ExtraOptions("pebble"))
+	if err != nil {
+		t.Fatalf("NewPebbleDBDatabase() unexpected error: %v", err)
+	}
+	return dbstorage.New(db, encF)
 }
 
 func newSliceStorage(encF storage.EncoderDecoderF) *slice.Storage {
@@ -59,24 +74,29 @@ func newRedisStorage(ctx context.Context, t *testing.T, encF storage.EncoderDeco
 
 func valueOf(t *testing.T, i int) *storage.QueuedTransaction {
 	t.Helper()
+	// #nosec G115
 	meta, err := rlp.EncodeToBytes(storage.BatchPosterPosition{DelayedMessageCount: uint64(i)})
 	if err != nil {
 		t.Fatalf("Encoding batch poster position, error: %v", err)
 	}
 	return &storage.QueuedTransaction{
 		FullTx: types.NewTransaction(
+			// #nosec G115
 			uint64(i),
 			common.Address{},
 			big.NewInt(int64(i)),
+			// #nosec G115
 			uint64(i),
 			big.NewInt(int64(i)),
 			[]byte{byte(i)}),
 		Meta: meta,
-		Data: types.DynamicFeeTx{
-			ChainID:    big.NewInt(int64(i)),
-			Nonce:      uint64(i),
-			GasTipCap:  big.NewInt(int64(i)),
-			GasFeeCap:  big.NewInt(int64(i)),
+		DeprecatedData: types.DynamicFeeTx{
+			ChainID: big.NewInt(int64(i)),
+			// #nosec G115
+			Nonce:     uint64(i),
+			GasTipCap: big.NewInt(int64(i)),
+			GasFeeCap: big.NewInt(int64(i)),
+			// #nosec G115
 			Gas:        uint64(i),
 			Value:      big.NewInt(int64(i)),
 			Data:       []byte{byte(i % 8)},
@@ -100,6 +120,7 @@ func values(t *testing.T, from, to int) []*storage.QueuedTransaction {
 func initStorage(ctx context.Context, t *testing.T, s QueueStorage) QueueStorage {
 	t.Helper()
 	for i := 0; i < 20; i++ {
+		// #nosec G115
 		if err := s.Put(ctx, uint64(i), nil, valueOf(t, i)); err != nil {
 			t.Fatalf("Error putting a key/value: %v", err)
 		}
@@ -120,6 +141,7 @@ func storages(t *testing.T) map[string]QueueStorage {
 		"sliceLegacy":   newSliceStorage(f(&storage.LegacyEncoderDecoder{})),
 		"redisLegacy":   newRedisStorage(context.Background(), t, f(&storage.LegacyEncoderDecoder{})),
 		"levelDB":       newLevelDBStorage(t, f(&storage.EncoderDecoder{})),
+		"pebbleDB":      newPebbleDBStorage(t, f(&storage.EncoderDecoder{})),
 		"slice":         newSliceStorage(f(&storage.EncoderDecoder{})),
 		"redis":         newRedisStorage(context.Background(), t, f(&storage.EncoderDecoder{})),
 	}
@@ -133,6 +155,34 @@ func initStorages(ctx context.Context, t *testing.T) map[string]QueueStorage {
 		m[k] = initStorage(ctx, t, v)
 	}
 	return m
+}
+
+func TestPruneAll(t *testing.T) {
+	s := newLevelDBStorage(t, func() storage.EncoderDecoderInterface { return &storage.EncoderDecoder{} })
+	ctx := context.Background()
+	for i := 0; i < 20; i++ {
+		// #nosec G115
+		if err := s.Put(ctx, uint64(i), nil, valueOf(t, i)); err != nil {
+			t.Fatalf("Error putting a key/value: %v", err)
+		}
+	}
+	size, err := s.Length(ctx)
+	if err != nil {
+		t.Fatalf("Length() unexpected error %v", err)
+	}
+	if size != 20 {
+		t.Errorf("Length()=%v want 20", size)
+	}
+	if err := s.PruneAll(ctx); err != nil {
+		t.Fatalf("PruneAll() unexpected error: %v", err)
+	}
+	size, err = s.Length(ctx)
+	if err != nil {
+		t.Fatalf("Length() unexpected error %v", err)
+	}
+	if size != 0 {
+		t.Errorf("Length()=%v want 0", size)
+	}
 }
 
 func TestFetchContents(t *testing.T) {
@@ -195,6 +245,7 @@ func TestLast(t *testing.T) {
 			ctx := context.Background()
 			for i := 0; i < cnt; i++ {
 				val := valueOf(t, i)
+				// #nosec G115
 				if err := s.Put(ctx, uint64(i), nil, val); err != nil {
 					t.Fatalf("Error putting a key/value: %v", err)
 				}
@@ -214,6 +265,7 @@ func TestLast(t *testing.T) {
 			for i := 0; i < cnt-1; i++ {
 				prev := valueOf(t, i)
 				newVal := valueOf(t, cnt+i)
+				// #nosec G115
 				if err := s.Put(ctx, uint64(i), prev, newVal); err != nil {
 					t.Fatalf("Error putting a key/value: %v, prev: %v, new: %v", err, prev, newVal)
 				}
@@ -321,6 +373,7 @@ func TestLength(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Length() unexpected error: %v", err)
 				}
+				// #nosec G115
 				if want := arbmath.MaxInt(0, 20-int(tc.pruneFrom)); got != want {
 					t.Errorf("Length() = %d want %d", got, want)
 				}

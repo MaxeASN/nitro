@@ -15,8 +15,10 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/offchainlabs/nitro/arbutil"
+	"github.com/ethereum/go-ethereum/ethclient"
 
+	"github.com/offchainlabs/nitro/arbstate/daprovider"
+	"github.com/offchainlabs/nitro/arbutil"
 	"github.com/offchainlabs/nitro/solgen/go/bridgegen"
 )
 
@@ -33,6 +35,7 @@ const (
 	batchDataTxInput batchDataLocation = iota
 	batchDataSeparateEvent
 	batchDataNone
+	batchDataBlobHashes
 )
 
 func init() {
@@ -43,17 +46,17 @@ func init() {
 	}
 	batchDeliveredID = sequencerBridgeABI.Events["SequencerBatchDelivered"].ID
 	sequencerBatchDataABI = sequencerBridgeABI.Events[sequencerBatchDataEvent]
-	addSequencerL2BatchFromOriginCallABI = sequencerBridgeABI.Methods["addSequencerL2BatchFromOrigin"]
+	addSequencerL2BatchFromOriginCallABI = sequencerBridgeABI.Methods["addSequencerL2BatchFromOrigin0"]
 }
 
 type SequencerInbox struct {
 	con       *bridgegen.SequencerInbox
 	address   common.Address
 	fromBlock int64
-	client    arbutil.L1Interface
+	client    *ethclient.Client
 }
 
-func NewSequencerInbox(client arbutil.L1Interface, addr common.Address, fromBlock int64) (*SequencerInbox, error) {
+func NewSequencerInbox(client *ethclient.Client, addr common.Address, fromBlock int64) (*SequencerInbox, error) {
 	con, err := bridgegen.NewSequencerInbox(addr, client)
 	if err != nil {
 		return nil, err
@@ -102,14 +105,14 @@ type SequencerInboxBatch struct {
 	AfterInboxAcc          common.Hash
 	AfterDelayedAcc        common.Hash
 	AfterDelayedCount      uint64
-	TimeBounds             bridgegen.ISequencerInboxTimeBounds
+	TimeBounds             bridgegen.IBridgeTimeBounds
 	rawLog                 types.Log
 	dataLocation           batchDataLocation
 	bridgeAddress          common.Address
 	serialized             []byte // nil if serialization isn't cached yet
 }
 
-func (m *SequencerInboxBatch) getSequencerData(ctx context.Context, client arbutil.L1Interface) ([]byte, error) {
+func (m *SequencerInboxBatch) getSequencerData(ctx context.Context, client *ethclient.Client) ([]byte, error) {
 	switch m.dataLocation {
 	case batchDataTxInput:
 		data, err := arbutil.GetLogEmitterTxData(ctx, client, m.rawLog)
@@ -121,7 +124,11 @@ func (m *SequencerInboxBatch) getSequencerData(ctx context.Context, client arbut
 		if err != nil {
 			return nil, err
 		}
-		return args["data"].([]byte), nil
+		dataBytes, ok := args["data"].([]byte)
+		if !ok {
+			return nil, errors.New("args[\"data\"] not a byte array")
+		}
+		return dataBytes, nil
 	case batchDataSeparateEvent:
 		var numberAsHash common.Hash
 		binary.BigEndian.PutUint64(numberAsHash[(32-8):], m.SequenceNumber)
@@ -149,12 +156,25 @@ func (m *SequencerInboxBatch) getSequencerData(ctx context.Context, client arbut
 	case batchDataNone:
 		// No data when in a force inclusion batch
 		return nil, nil
+	case batchDataBlobHashes:
+		tx, err := arbutil.GetLogTransaction(ctx, client, m.rawLog)
+		if err != nil {
+			return nil, err
+		}
+		if len(tx.BlobHashes()) == 0 {
+			return nil, fmt.Errorf("blob batch transaction %v has no blobs", tx.Hash())
+		}
+		data := []byte{daprovider.BlobHashesHeaderFlag}
+		for _, h := range tx.BlobHashes() {
+			data = append(data, h[:]...)
+		}
+		return data, nil
 	default:
 		return nil, fmt.Errorf("batch has invalid data location %v", m.dataLocation)
 	}
 }
 
-func (m *SequencerInboxBatch) Serialize(ctx context.Context, client arbutil.L1Interface) ([]byte, error) {
+func (m *SequencerInboxBatch) Serialize(ctx context.Context, client *ethclient.Client) ([]byte, error) {
 	if m.serialized != nil {
 		return m.serialized, nil
 	}
@@ -217,7 +237,7 @@ func (i *SequencerInbox) LookupBatchesInRange(ctx context.Context, from, to *big
 		seqNum := parsedLog.BatchSequenceNumber.Uint64()
 		if lastSeqNum != nil {
 			if seqNum != *lastSeqNum+1 {
-				return nil, fmt.Errorf("sequencer batches out of order; after batch %v got batch %v", lastSeqNum, seqNum)
+				return nil, fmt.Errorf("sequencer batches out of order; after batch %v got batch %v", *lastSeqNum, seqNum)
 			}
 		}
 		lastSeqNum = &seqNum

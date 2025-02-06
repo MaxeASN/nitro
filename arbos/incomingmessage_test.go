@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/offchainlabs/nitro/arbos/arbostypes"
 )
 
@@ -36,7 +37,7 @@ func TestSerializeAndParseL1Message(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	txes, err := ParseL2Transactions(newMsg, chainId, nil)
+	txes, err := ParseL2Transactions(newMsg, chainId)
 	if err != nil {
 		t.Error(err)
 	}

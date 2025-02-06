@@ -8,19 +8,24 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/rpc"
+
 	"github.com/offchainlabs/nitro/arbnode"
-	"github.com/offchainlabs/nitro/arbnode/execution"
 	"github.com/offchainlabs/nitro/arbos/arbostypes"
 	"github.com/offchainlabs/nitro/arbutil"
+	"github.com/offchainlabs/nitro/execution"
 	"github.com/offchainlabs/nitro/staker"
 	"github.com/offchainlabs/nitro/util/containers"
 	"github.com/offchainlabs/nitro/util/rpcclient"
 	"github.com/offchainlabs/nitro/validator"
+	validatorclient "github.com/offchainlabs/nitro/validator/client"
 	"github.com/offchainlabs/nitro/validator/server_api"
 	"github.com/offchainlabs/nitro/validator/server_arb"
+	"github.com/offchainlabs/nitro/validator/valnode"
 )
 
 type mockSpawner struct {
@@ -33,12 +38,13 @@ var sendRootKey = common.HexToHash("0x55667788")
 var batchNumKey = common.HexToHash("0x99aabbcc")
 var posInBatchKey = common.HexToHash("0xddeeff")
 
-func globalstateFromTestPreimages(preimages map[common.Hash][]byte) validator.GoGlobalState {
+func globalstateFromTestPreimages(preimages map[arbutil.PreimageType]map[common.Hash][]byte) validator.GoGlobalState {
+	keccakPreimages := preimages[arbutil.Keccak256PreimageType]
 	return validator.GoGlobalState{
-		Batch:      new(big.Int).SetBytes(preimages[batchNumKey]).Uint64(),
-		PosInBatch: new(big.Int).SetBytes(preimages[posInBatchKey]).Uint64(),
-		BlockHash:  common.BytesToHash(preimages[blockHashKey]),
-		SendRoot:   common.BytesToHash(preimages[sendRootKey]),
+		Batch:      new(big.Int).SetBytes(keccakPreimages[batchNumKey]).Uint64(),
+		PosInBatch: new(big.Int).SetBytes(keccakPreimages[posInBatchKey]).Uint64(),
+		BlockHash:  common.BytesToHash(keccakPreimages[blockHashKey]),
+		SendRoot:   common.BytesToHash(keccakPreimages[sendRootKey]),
 	}
 }
 
@@ -51,6 +57,14 @@ func globalstateToTestPreimages(gs validator.GoGlobalState) map[common.Hash][]by
 	return preimages
 }
 
+func (s *mockSpawner) WasmModuleRoots() ([]common.Hash, error) {
+	return mockWasmModuleRoots, nil
+}
+
+func (s *mockSpawner) StylusArchs() []ethdb.WasmTarget {
+	return []ethdb.WasmTarget{"mock"}
+}
+
 func (s *mockSpawner) Launch(entry *validator.ValidationInput, moduleRoot common.Hash) validator.ValidationRun {
 	run := &mockValRun{
 		Promise: containers.NewPromise[validator.GoGlobalState](nil),
@@ -61,14 +75,16 @@ func (s *mockSpawner) Launch(entry *validator.ValidationInput, moduleRoot common
 	return run
 }
 
-var mockWasmModuleRoot common.Hash = common.HexToHash("0xa5a5a5")
+var mockWasmModuleRoots []common.Hash = []common.Hash{common.HexToHash("0xa5a5a5"), common.HexToHash("0x1212")}
 
-func (s *mockSpawner) Start(context.Context) error { return nil }
-func (s *mockSpawner) Stop()                       {}
-func (s *mockSpawner) Name() string                { return "mock" }
-func (s *mockSpawner) Room() int                   { return 4 }
+func (s *mockSpawner) Start(context.Context) error {
+	return nil
+}
+func (s *mockSpawner) Stop()        {}
+func (s *mockSpawner) Name() string { return "mock" }
+func (s *mockSpawner) Room() int    { return 4 }
 
-func (s *mockSpawner) CreateExecutionRun(wasmModuleRoot common.Hash, input *validator.ValidationInput) containers.PromiseInterface[validator.ExecutionRun] {
+func (s *mockSpawner) CreateExecutionRun(wasmModuleRoot common.Hash, input *validator.ValidationInput, _ bool) containers.PromiseInterface[validator.ExecutionRun] {
 	s.ExecSpawned = append(s.ExecSpawned, input.Id)
 	return containers.NewReadyPromise[validator.ExecutionRun](&mockExecRun{
 		startState: input.StartState,
@@ -77,11 +93,7 @@ func (s *mockSpawner) CreateExecutionRun(wasmModuleRoot common.Hash, input *vali
 }
 
 func (s *mockSpawner) LatestWasmModuleRoot() containers.PromiseInterface[common.Hash] {
-	return containers.NewReadyPromise[common.Hash](mockWasmModuleRoot, nil)
-}
-
-func (s *mockSpawner) WriteToFile(input *validator.ValidationInput, expOut validator.GoGlobalState, moduleRoot common.Hash) containers.PromiseInterface[struct{}] {
-	return containers.NewReadyPromise[struct{}](struct{}{}, nil)
+	return containers.NewReadyPromise[common.Hash](mockWasmModuleRoots[0], nil)
 }
 
 type mockValRun struct {
@@ -115,6 +127,20 @@ func (r *mockExecRun) GetStepAt(position uint64) containers.PromiseInterface[*va
 	}, nil)
 }
 
+func (r *mockExecRun) GetMachineHashesWithStepSize(machineStartIndex, stepSize, maxIterations uint64) containers.PromiseInterface[[]common.Hash] {
+	ctx := context.Background()
+	hashes := make([]common.Hash, 0)
+	for i := uint64(0); i < maxIterations; i++ {
+		absoluteMachineIndex := machineStartIndex + stepSize*(i+1)
+		stepResult, err := r.GetStepAt(absoluteMachineIndex).Await(ctx)
+		if err != nil {
+			return containers.NewReadyPromise[[]common.Hash](nil, err)
+		}
+		hashes = append(hashes, stepResult.Hash)
+	}
+	return containers.NewReadyPromise[[]common.Hash](hashes, nil)
+}
+
 func (r *mockExecRun) GetLastStep() containers.PromiseInterface[*validator.MachineStepResult] {
 	return r.GetStepAt(mockExecLastPos)
 }
@@ -127,6 +153,10 @@ func (r *mockExecRun) GetProofAt(uint64) containers.PromiseInterface[[]byte] {
 
 func (r *mockExecRun) PrepareRange(uint64, uint64) containers.PromiseInterface[struct{}] {
 	return containers.NewReadyPromise[struct{}](struct{}{}, nil)
+}
+
+func (r *mockExecRun) CheckAlive(ctx context.Context) error {
+	return nil
 }
 
 func (r *mockExecRun) Close() {}
@@ -149,7 +179,7 @@ func createMockValidationNode(t *testing.T, ctx context.Context, config *server_
 	}
 	configFetcher := func() *server_arb.ArbitratorSpawnerConfig { return config }
 	spawner := &mockSpawner{}
-	serverAPI := server_api.NewExecutionServerAPI(spawner, spawner, configFetcher)
+	serverAPI := valnode.NewExecutionServerAPI(spawner, spawner, configFetcher)
 
 	valAPIs := []rpc.API{{
 		Namespace:     server_api.Namespace,
@@ -180,15 +210,26 @@ func TestValidationServerAPI(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_, validationDefault := createMockValidationNode(t, ctx, nil)
-	client := server_api.NewExecutionClient(StaticFetcherFrom(t, &rpcclient.TestClientConfig), validationDefault)
+	client := validatorclient.NewExecutionClient(StaticFetcherFrom(t, &rpcclient.TestClientConfig), validationDefault)
 	err := client.Start(ctx)
 	Require(t, err)
 
 	wasmRoot, err := client.LatestWasmModuleRoot().Await(ctx)
 	Require(t, err)
 
-	if wasmRoot != mockWasmModuleRoot {
+	if wasmRoot != mockWasmModuleRoots[0] {
 		t.Error("unexpected mock wasmModuleRoot")
+	}
+
+	roots, err := client.WasmModuleRoots()
+	Require(t, err)
+	if len(roots) != len(mockWasmModuleRoots) {
+		Fatal(t, "wrong number of wasmModuleRoots", len(roots))
+	}
+	for i := range roots {
+		if roots[i] != mockWasmModuleRoots[i] {
+			Fatal(t, "unexpected root", roots[i], mockWasmModuleRoots[i])
+		}
 	}
 
 	hash1 := common.HexToHash("0x11223344556677889900aabbccddeeff")
@@ -209,7 +250,9 @@ func TestValidationServerAPI(t *testing.T) {
 
 	valInput := validator.ValidationInput{
 		StartState: startState,
-		Preimages:  globalstateToTestPreimages(endState),
+		Preimages: map[arbutil.PreimageType]map[common.Hash][]byte{
+			arbutil.Keccak256PreimageType: globalstateToTestPreimages(endState),
+		},
 	}
 	valRun := client.Launch(&valInput, wasmRoot)
 	res, err := valRun.Await(ctx)
@@ -217,7 +260,7 @@ func TestValidationServerAPI(t *testing.T) {
 	if res != endState {
 		t.Error("unexpected mock validation run")
 	}
-	execRun, err := client.CreateExecutionRun(wasmRoot, &valInput).Await(ctx)
+	execRun, err := client.CreateExecutionRun(wasmRoot, &valInput, false).Await(ctx)
 	Require(t, err)
 	step0 := execRun.GetStepAt(0)
 	step0Res, err := step0.Await(ctx)
@@ -244,7 +287,7 @@ func TestValidationClientRoom(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	mockSpawner, spawnerStack := createMockValidationNode(t, ctx, nil)
-	client := server_api.NewExecutionClient(StaticFetcherFrom(t, &rpcclient.TestClientConfig), spawnerStack)
+	client := validatorclient.NewExecutionClient(StaticFetcherFrom(t, &rpcclient.TestClientConfig), spawnerStack)
 	err := client.Start(ctx)
 	Require(t, err)
 
@@ -273,7 +316,9 @@ func TestValidationClientRoom(t *testing.T) {
 
 	valInput := validator.ValidationInput{
 		StartState: startState,
-		Preimages:  globalstateToTestPreimages(endState),
+		Preimages: map[arbutil.PreimageType]map[common.Hash][]byte{
+			arbutil.Keccak256PreimageType: globalstateToTestPreimages(endState),
+		},
 	}
 
 	valRuns := make([]validator.ValidationRun, 0, 4)
@@ -329,10 +374,10 @@ func TestExecutionKeepAlive(t *testing.T) {
 	_, validationShortTO := createMockValidationNode(t, ctx, &shortTimeoutConfig)
 	configFetcher := StaticFetcherFrom(t, &rpcclient.TestClientConfig)
 
-	clientDefault := server_api.NewExecutionClient(configFetcher, validationDefault)
+	clientDefault := validatorclient.NewExecutionClient(configFetcher, validationDefault)
 	err := clientDefault.Start(ctx)
 	Require(t, err)
-	clientShortTO := server_api.NewExecutionClient(configFetcher, validationShortTO)
+	clientShortTO := validatorclient.NewExecutionClient(configFetcher, validationShortTO)
 	err = clientShortTO.Start(ctx)
 	Require(t, err)
 
@@ -340,9 +385,9 @@ func TestExecutionKeepAlive(t *testing.T) {
 	Require(t, err)
 
 	valInput := validator.ValidationInput{}
-	runDefault, err := clientDefault.CreateExecutionRun(wasmRoot, &valInput).Await(ctx)
+	runDefault, err := clientDefault.CreateExecutionRun(wasmRoot, &valInput, false).Await(ctx)
 	Require(t, err)
-	runShortTO, err := clientShortTO.CreateExecutionRun(wasmRoot, &valInput).Await(ctx)
+	runShortTO, err := clientShortTO.CreateExecutionRun(wasmRoot, &valInput, false).Await(ctx)
 	Require(t, err)
 	<-time.After(time.Second * 10)
 	stepDefault := runDefault.GetStepAt(0)
@@ -384,6 +429,7 @@ func (m *mockBlockRecorder) RecordBlockCreation(
 		Pos:       pos,
 		BlockHash: res.BlockHash,
 		Preimages: globalstateToTestPreimages(globalState),
+		UserWasms: make(state.UserWasms),
 	}, nil
 }
 

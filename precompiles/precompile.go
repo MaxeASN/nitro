@@ -1,22 +1,18 @@
-// Copyright 2021-2023, Offchain Labs, Inc.
+// Copyright 2021-2024, Offchain Labs, Inc.
 // For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE
 
 package precompiles
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
-
-	"github.com/offchainlabs/nitro/arbos"
-	"github.com/offchainlabs/nitro/arbos/arbosState"
-	"github.com/offchainlabs/nitro/arbos/util"
-	templates "github.com/offchainlabs/nitro/solgen/go/precompilesgen"
-	"github.com/offchainlabs/nitro/util/arbmath"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -27,6 +23,13 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	glog "github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+
+	"github.com/offchainlabs/nitro/arbos"
+	"github.com/offchainlabs/nitro/arbos/arbosState"
+	"github.com/offchainlabs/nitro/arbos/programs"
+	"github.com/offchainlabs/nitro/arbos/util"
+	pgen "github.com/offchainlabs/nitro/solgen/go/precompilesgen"
+	"github.com/offchainlabs/nitro/util/arbmath"
 )
 
 type ArbosPrecompile interface {
@@ -69,11 +72,12 @@ type Precompile struct {
 }
 
 type PrecompileMethod struct {
-	name         string
-	template     abi.Method
-	purity       purity
-	handler      reflect.Method
-	arbosVersion uint64
+	name            string
+	template        abi.Method
+	purity          purity
+	handler         reflect.Method
+	arbosVersion    uint64
+	maxArbosVersion uint64
 }
 
 type PrecompileEvent struct {
@@ -96,12 +100,8 @@ func RenderSolError(solErr abi.Error, data []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	valsRange, ok := vals.([]interface{})
-	if !ok {
-		return "", errors.New("unexpected unpack result")
-	}
-	strVals := make([]string, 0, len(valsRange))
-	for _, val := range valsRange {
+	strVals := make([]string, 0, len(vals))
+	for _, val := range vals {
 		strVals = append(strVals, fmt.Sprintf("%v", val))
 	}
 	return fmt.Sprintf("error %v(%v)", solErr.Name, strings.Join(strVals, ", ")), nil
@@ -120,7 +120,7 @@ func (e *SolError) Error() string {
 func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Precompile) {
 	source, err := abi.JSON(strings.NewReader(metadata.ABI))
 	if err != nil {
-		log.Crit("Bad ABI")
+		panic("Bad ABI")
 	}
 
 	implementerType := reflect.TypeOf(implementer)
@@ -128,12 +128,12 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 
 	_, ok := implementerType.Elem().FieldByName("Address")
 	if !ok {
-		log.Crit("Implementer for precompile ", contract, " is missing an Address field")
+		panic("Implementer for precompile " + contract + " is missing an Address field")
 	}
 
 	address, ok := reflect.ValueOf(implementer).Elem().FieldByName("Address").Interface().(addr)
 	if !ok {
-		log.Crit("Implementer for precompile ", contract, "'s Address field has the wrong type")
+		panic("Implementer for precompile " + contract + "'s Address field has the wrong type")
 	}
 
 	gethAbiFuncTypeEquality := func(actual, geth reflect.Type) bool {
@@ -167,7 +167,7 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 		name = capitalize + name[1:]
 
 		if len(method.ID) != 4 {
-			log.Crit("Method ID isn't 4 bytes")
+			panic("Method ID isn't 4 bytes")
 		}
 		id := *(*[4]byte)(method.ID)
 
@@ -175,7 +175,7 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 
 		handler, ok := implementerType.MethodByName(name)
 		if !ok {
-			log.Crit("Precompile " + contract + " must implement " + name)
+			panic("Precompile " + contract + " must implement " + name)
 		}
 
 		var needs = []reflect.Type{
@@ -199,7 +199,7 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 			needs = append(needs, reflect.TypeOf(&big.Int{}))
 			purity = payable
 		default:
-			log.Crit("Unknown state mutability ", method.StateMutability)
+			panic("Unknown state mutability " + method.StateMutability)
 		}
 
 		for _, arg := range method.Inputs {
@@ -215,10 +215,9 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 		expectedHandlerType := reflect.FuncOf(needs, outputs, false)
 
 		if !gethAbiFuncTypeEquality(handler.Type, expectedHandlerType) {
-			log.Crit(
-				"Precompile "+contract+"'s "+name+"'s implementer has the wrong type\n",
-				"\texpected:\t", expectedHandlerType, "\n\tbut have:\t", handler.Type,
-			)
+			panic(
+				"Precompile " + contract + "'s " + name + "'s implementer has the wrong type\n" +
+					"\texpected:\t" + expectedHandlerType.String() + "\n\tbut have:\t" + handler.Type.String())
 		}
 
 		method := PrecompileMethod{
@@ -226,6 +225,7 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 			method,
 			purity,
 			handler,
+			0,
 			0,
 		}
 		methods[id] = &method
@@ -236,7 +236,7 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 		method := implementerType.Method(i)
 		name := method.Name
 		if method.IsExported() && methodsByName[name] == nil {
-			log.Crit(contract + " is missing a solidity interface for " + name)
+			panic(contract + " is missing a solidity interface for " + name)
 		}
 	}
 
@@ -268,11 +268,10 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 			if arg.Indexed {
 				_, ok := supportedIndices[arg.Type.String()]
 				if !ok {
-					log.Crit(
-						"Please change the solidity for precompile ", contract,
-						"'s event ", name, ":\n\tEvent indices of type ",
-						arg.Type.String(), " are not supported",
-					)
+					panic(
+						"Please change the solidity for precompile " + contract +
+							"'s event " + name + ":\n\tEvent indices of type " +
+							arg.Type.String() + " are not supported")
 				}
 			}
 		}
@@ -287,23 +286,21 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 
 		field, ok := implementerType.Elem().FieldByName(name)
 		if !ok {
-			log.Crit(missing, "event ", name, " of type\n\t", expectedFieldType)
+			panic(missing + "event " + name + " of type\n\t" + expectedFieldType.String())
 		}
 		costField, ok := implementerType.Elem().FieldByName(name + "GasCost")
 		if !ok {
-			log.Crit(missing, "event ", name, "'s GasCost of type\n\t", expectedCostType)
+			panic(missing + "event " + name + "'s GasCost of type\n\t" + expectedCostType.String())
 		}
 		if !gethAbiFuncTypeEquality(field.Type, expectedFieldType) {
-			log.Crit(
-				context, "'s field for event ", name, " has the wrong type\n",
-				"\texpected:\t", expectedFieldType, "\n\tbut have:\t", field.Type,
-			)
+			panic(
+				context + "'s field for event " + name + " has the wrong type\n" +
+					"\texpected:\t" + expectedFieldType.String() + "\n\tbut have:\t" + field.Type.String())
 		}
 		if !gethAbiFuncTypeEquality(costField.Type, expectedCostType) {
-			log.Crit(
-				context, "'s field for event ", name, "GasCost has the wrong type\n",
-				"\texpected:\t", expectedCostType, "\n\tbut have:\t", costField.Type,
-			)
+			panic(
+				context + "'s field for event " + name + "GasCost has the wrong type\n" +
+					"\texpected:\t" + expectedCostType.String() + "\n\tbut have:\t" + costField.Type.String())
 		}
 
 		structFields := reflect.ValueOf(implementer).Elem()
@@ -328,6 +325,7 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 		gascost := func(args []reflect.Value) []reflect.Value {
 
 			cost := params.LogGas
+			// #nosec G115
 			cost += params.LogTopicGas * uint64(1+len(topicInputs))
 
 			var dataValues []interface{}
@@ -359,14 +357,14 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 			args = args[2:]
 
 			version := arbosState.ArbOSVersion(state)
-			if callerCtx.readOnly && version >= 11 {
+			if callerCtx.readOnly && version >= params.ArbosVersion_11 {
 				return []reflect.Value{reflect.ValueOf(vm.ErrWriteProtection)}
 			}
 
 			emitCost := gascost(args)
 			cost := emitCost[0].Interface().(uint64) //nolint:errcheck
 			if !emitCost[1].IsNil() {
-				// an error occured during gascost()
+				// an error occurred during gascost()
 				return []reflect.Value{emitCost[1]}
 			}
 			if err := callerCtx.Burn(cost); err != nil {
@@ -462,13 +460,12 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 
 		field, ok := implementerType.Elem().FieldByName(name + "Error")
 		if !ok {
-			log.Crit(missing, "custom error ", name, "Error of type\n\t", expectedFieldType)
+			panic(missing + "custom error " + name + "Error of type\n\t" + expectedFieldType.String())
 		}
 		if field.Type != expectedFieldType {
-			log.Crit(
-				context, "'s field for error ", name, "Error has the wrong type\n",
-				"\texpected:\t", expectedFieldType, "\n\tbut have:\t", field.Type,
-			)
+			panic(
+				context + "'s field for error " + name + "Error has the wrong type\n" +
+					"\texpected:\t" + expectedFieldType.String() + "\n\tbut have:\t" + field.Type.String())
 		}
 
 		structFields := reflect.ValueOf(implementer).Elem()
@@ -516,12 +513,6 @@ func MakePrecompile(metadata *bind.MetaData, implementer interface{}) (addr, *Pr
 }
 
 func Precompiles() map[addr]ArbosPrecompile {
-
-	//nolint:gocritic
-	hex := func(s string) addr {
-		return common.HexToAddress(s)
-	}
-
 	contracts := make(map[addr]ArbosPrecompile)
 
 	insert := func(address addr, impl ArbosPrecompile) *Precompile {
@@ -529,17 +520,22 @@ func Precompiles() map[addr]ArbosPrecompile {
 		return impl.Precompile()
 	}
 
-	insert(MakePrecompile(templates.ArbInfoMetaData, &ArbInfo{Address: hex("65")}))
-	insert(MakePrecompile(templates.ArbAddressTableMetaData, &ArbAddressTable{Address: hex("66")}))
-	insert(MakePrecompile(templates.ArbBLSMetaData, &ArbBLS{Address: hex("67")}))
-	insert(MakePrecompile(templates.ArbFunctionTableMetaData, &ArbFunctionTable{Address: hex("68")}))
-	insert(MakePrecompile(templates.ArbosTestMetaData, &ArbosTest{Address: hex("69")}))
-	ArbGasInfo := insert(MakePrecompile(templates.ArbGasInfoMetaData, &ArbGasInfo{Address: hex("6c")}))
-	ArbGasInfo.methodsByName["GetL1FeesAvailable"].arbosVersion = 10
-	ArbGasInfo.methodsByName["GetL1RewardRate"].arbosVersion = 11
-	ArbGasInfo.methodsByName["GetL1RewardRecipient"].arbosVersion = 11
-	insert(MakePrecompile(templates.ArbAggregatorMetaData, &ArbAggregator{Address: hex("6d")}))
-	insert(MakePrecompile(templates.ArbStatisticsMetaData, &ArbStatistics{Address: hex("6f")}))
+	insert(MakePrecompile(pgen.ArbInfoMetaData, &ArbInfo{Address: types.ArbInfoAddress}))
+	insert(MakePrecompile(pgen.ArbAddressTableMetaData, &ArbAddressTable{Address: types.ArbAddressTableAddress}))
+	insert(MakePrecompile(pgen.ArbBLSMetaData, &ArbBLS{Address: types.ArbBLSAddress}))
+	insert(MakePrecompile(pgen.ArbFunctionTableMetaData, &ArbFunctionTable{Address: types.ArbFunctionTableAddress}))
+	insert(MakePrecompile(pgen.ArbosTestMetaData, &ArbosTest{Address: types.ArbosTestAddress}))
+	ArbGasInfo := insert(MakePrecompile(pgen.ArbGasInfoMetaData, &ArbGasInfo{Address: types.ArbGasInfoAddress}))
+	ArbGasInfo.methodsByName["GetL1FeesAvailable"].arbosVersion = params.ArbosVersion_10
+	ArbGasInfo.methodsByName["GetL1RewardRate"].arbosVersion = params.ArbosVersion_11
+	ArbGasInfo.methodsByName["GetL1RewardRecipient"].arbosVersion = params.ArbosVersion_11
+	ArbGasInfo.methodsByName["GetL1PricingEquilibrationUnits"].arbosVersion = params.ArbosVersion_20
+	ArbGasInfo.methodsByName["GetLastL1PricingUpdateTime"].arbosVersion = params.ArbosVersion_20
+	ArbGasInfo.methodsByName["GetL1PricingFundsDueForRewards"].arbosVersion = params.ArbosVersion_20
+	ArbGasInfo.methodsByName["GetL1PricingUnitsSinceUpdate"].arbosVersion = params.ArbosVersion_20
+	ArbGasInfo.methodsByName["GetLastL1PricingSurplus"].arbosVersion = params.ArbosVersion_20
+	insert(MakePrecompile(pgen.ArbAggregatorMetaData, &ArbAggregator{Address: types.ArbAggregatorAddress}))
+	insert(MakePrecompile(pgen.ArbStatisticsMetaData, &ArbStatistics{Address: types.ArbStatisticsAddress}))
 
 	eventCtx := func(gasLimit uint64, err error) *Context {
 		if err != nil {
@@ -551,12 +547,37 @@ func Precompiles() map[addr]ArbosPrecompile {
 		}
 	}
 
-	ArbOwnerPublic := insert(MakePrecompile(templates.ArbOwnerPublicMetaData, &ArbOwnerPublic{Address: hex("6b")}))
-	ArbOwnerPublic.methodsByName["GetInfraFeeAccount"].arbosVersion = 5
-	ArbOwnerPublic.methodsByName["RectifyChainOwner"].arbosVersion = 11
+	ArbOwnerPublicImpl := &ArbOwnerPublic{Address: types.ArbOwnerPublicAddress}
+	ArbOwnerPublic := insert(MakePrecompile(pgen.ArbOwnerPublicMetaData, ArbOwnerPublicImpl))
+	ArbOwnerPublic.methodsByName["GetInfraFeeAccount"].arbosVersion = params.ArbosVersion_5
+	ArbOwnerPublic.methodsByName["RectifyChainOwner"].arbosVersion = params.ArbosVersion_11
+	ArbOwnerPublic.methodsByName["GetBrotliCompressionLevel"].arbosVersion = params.ArbosVersion_20
+	ArbOwnerPublic.methodsByName["GetScheduledUpgrade"].arbosVersion = params.ArbosVersion_20
+
+	ArbWasmImpl := &ArbWasm{Address: types.ArbWasmAddress}
+	ArbWasm := insert(MakePrecompile(pgen.ArbWasmMetaData, ArbWasmImpl))
+	ArbWasm.arbosVersion = params.ArbosVersion_Stylus
+	programs.ProgramNotWasmError = ArbWasmImpl.ProgramNotWasmError
+	programs.ProgramNotActivatedError = ArbWasmImpl.ProgramNotActivatedError
+	programs.ProgramNeedsUpgradeError = ArbWasmImpl.ProgramNeedsUpgradeError
+	programs.ProgramExpiredError = ArbWasmImpl.ProgramExpiredError
+	programs.ProgramUpToDateError = ArbWasmImpl.ProgramUpToDateError
+	programs.ProgramKeepaliveTooSoon = ArbWasmImpl.ProgramKeepaliveTooSoonError
+	for _, method := range ArbWasm.methods {
+		method.arbosVersion = ArbWasm.arbosVersion
+	}
+
+	ArbWasmCacheImpl := &ArbWasmCache{Address: types.ArbWasmCacheAddress}
+	ArbWasmCache := insert(MakePrecompile(pgen.ArbWasmCacheMetaData, ArbWasmCacheImpl))
+	ArbWasmCache.arbosVersion = params.ArbosVersion_Stylus
+	for _, method := range ArbWasmCache.methods {
+		method.arbosVersion = ArbWasmCache.arbosVersion
+	}
+	ArbWasmCache.methodsByName["CacheCodehash"].maxArbosVersion = params.ArbosVersion_Stylus
+	ArbWasmCache.methodsByName["CacheProgram"].arbosVersion = params.ArbosVersion_StylusFixes
 
 	ArbRetryableImpl := &ArbRetryableTx{Address: types.ArbRetryableTxAddress}
-	ArbRetryable := insert(MakePrecompile(templates.ArbRetryableTxMetaData, ArbRetryableImpl))
+	ArbRetryable := insert(MakePrecompile(pgen.ArbRetryableTxMetaData, ArbRetryableImpl))
 	arbos.ArbRetryableTxAddress = ArbRetryable.address
 	arbos.RedeemScheduledEventID = ArbRetryable.events["RedeemScheduled"].template.ID
 	arbos.EmitReedeemScheduledEvent = func(
@@ -574,28 +595,45 @@ func Precompiles() map[addr]ArbosPrecompile {
 		return ArbRetryableImpl.TicketCreated(context, evm, ticketId)
 	}
 
-	ArbSys := insert(MakePrecompile(templates.ArbSysMetaData, &ArbSys{Address: types.ArbSysAddress}))
+	ArbSys := insert(MakePrecompile(pgen.ArbSysMetaData, &ArbSys{Address: types.ArbSysAddress}))
 	arbos.ArbSysAddress = ArbSys.address
 	arbos.L2ToL1TransactionEventID = ArbSys.events["L2ToL1Transaction"].template.ID
 	arbos.L2ToL1TxEventID = ArbSys.events["L2ToL1Tx"].template.ID
 
-	ArbOwnerImpl := &ArbOwner{Address: hex("70")}
+	ArbOwnerImpl := &ArbOwner{Address: types.ArbOwnerAddress}
 	emitOwnerActs := func(evm mech, method bytes4, owner addr, data []byte) error {
 		context := eventCtx(ArbOwnerImpl.OwnerActsGasCost(method, owner, data))
 		return ArbOwnerImpl.OwnerActs(context, evm, method, owner, data)
 	}
-	_, ArbOwner := MakePrecompile(templates.ArbOwnerMetaData, ArbOwnerImpl)
-	ArbOwner.methodsByName["GetInfraFeeAccount"].arbosVersion = 5
-	ArbOwner.methodsByName["SetInfraFeeAccount"].arbosVersion = 5
-	ArbOwner.methodsByName["ReleaseL1PricerSurplusFunds"].arbosVersion = 10
-	ArbOwner.methodsByName["SetChainConfig"].arbosVersion = 11
+	_, ArbOwner := MakePrecompile(pgen.ArbOwnerMetaData, ArbOwnerImpl)
+	ArbOwner.methodsByName["GetInfraFeeAccount"].arbosVersion = params.ArbosVersion_5
+	ArbOwner.methodsByName["SetInfraFeeAccount"].arbosVersion = params.ArbosVersion_5
+	ArbOwner.methodsByName["ReleaseL1PricerSurplusFunds"].arbosVersion = params.ArbosVersion_10
+	ArbOwner.methodsByName["SetChainConfig"].arbosVersion = params.ArbosVersion_11
+	ArbOwner.methodsByName["SetBrotliCompressionLevel"].arbosVersion = params.ArbosVersion_20
+	stylusMethods := []string{
+		"SetInkPrice", "SetWasmMaxStackDepth", "SetWasmFreePages", "SetWasmPageGas",
+		"SetWasmPageLimit", "SetWasmMinInitGas", "SetWasmInitCostScalar",
+		"SetWasmExpiryDays", "SetWasmKeepaliveDays",
+		"SetWasmBlockCacheSize", "AddWasmCacheManager", "RemoveWasmCacheManager",
+	}
+	for _, method := range stylusMethods {
+		ArbOwner.methodsByName[method].arbosVersion = params.ArbosVersion_Stylus
+	}
 
 	insert(ownerOnly(ArbOwnerImpl.Address, ArbOwner, emitOwnerActs))
-	insert(debugOnly(MakePrecompile(templates.ArbDebugMetaData, &ArbDebug{Address: hex("ff")})))
+	_, arbDebug := MakePrecompile(pgen.ArbDebugMetaData, &ArbDebug{Address: types.ArbDebugAddress})
+	arbDebug.methodsByName["Panic"].arbosVersion = params.ArbosVersion_Stylus
+	insert(debugOnly(arbDebug.address, arbDebug))
 
-	ArbosActs := insert(MakePrecompile(templates.ArbosActsMetaData, &ArbosActs{Address: types.ArbosAddress}))
+	ArbosActs := insert(MakePrecompile(pgen.ArbosActsMetaData, &ArbosActs{Address: types.ArbosAddress}))
 	arbos.InternalTxStartBlockMethodID = ArbosActs.GetMethodID("StartBlock")
 	arbos.InternalTxBatchPostingReportMethodID = ArbosActs.GetMethodID("BatchPostingReport")
+
+	for _, contract := range contracts {
+		precompile := contract.Precompile()
+		arbosState.PrecompileMinArbOSVersions[precompile.address] = precompile.arbosVersion
+	}
 
 	return contracts
 }
@@ -612,6 +650,10 @@ func (p *Precompile) GetMethodID(name string) bytes4 {
 		panic(fmt.Sprintf("Precompile %v does not have a method with the name %v", p.name, name))
 	}
 	return *(*bytes4)(method.template.ID)
+}
+
+func (p *Precompile) ArbosVersion() uint64 {
+	return p.arbosVersion
 }
 
 // Call a precompile in typed form, deserializing its inputs and serializing its outputs
@@ -638,7 +680,7 @@ func (p *Precompile) Call(
 	}
 	id := *(*[4]byte)(input)
 	method, ok := p.methods[id]
-	if !ok || arbosVersion < method.arbosVersion {
+	if !ok || arbosVersion < method.arbosVersion || (method.maxArbosVersion > 0 && arbosVersion > method.maxArbosVersion) {
 		// method does not exist or hasn't yet been activated
 		return nil, 0, vm.ErrExecutionReverted
 	}
@@ -666,6 +708,8 @@ func (p *Precompile) Call(
 		tracingInfo: util.NewTracingInfo(evm, caller, precompileAddress, util.TracingDuringEVM),
 	}
 
+	// len(input) must be at least 4 because of the check near the start of this function
+	// #nosec G115
 	argsCost := params.CopyGas * arbmath.WordsForBytes(uint64(len(input)-4))
 	if err := callerCtx.Burn(argsCost); err != nil {
 		// user cannot afford the argument data supplied
@@ -707,7 +751,7 @@ func (p *Precompile) Call(
 		reflectArgs = append(reflectArgs, reflect.ValueOf(evm))
 		reflectArgs = append(reflectArgs, reflect.ValueOf(value))
 	default:
-		log.Crit("Unknown state mutability ", method.purity)
+		panic("Unknown state mutability " + strconv.Itoa(int(method.purity)))
 	}
 
 	args, err := method.template.Inputs.Unpack(input[4:])
@@ -739,11 +783,17 @@ func (p *Precompile) Call(
 			}
 			return solErr.data, callerCtx.gasLeft, vm.ErrExecutionReverted
 		}
+		if errors.Is(errRet, programs.ErrProgramActivation) {
+			return nil, 0, errRet
+		}
 		if !errors.Is(errRet, vm.ErrOutOfGas) {
-			log.Debug("precompile reverted with non-solidity error", "precompile", precompileAddress, "input", input, "err", errRet)
+			log.Debug(
+				"precompile reverted with non-solidity error",
+				"precompile", precompileAddress, "input", input, "err", errRet,
+			)
 		}
 		// nolint:errorlint
-		if arbosVersion >= 11 || errRet == vm.ErrExecutionReverted {
+		if arbosVersion >= params.ArbosVersion_11 || errRet == vm.ErrExecutionReverted {
 			return nil, callerCtx.gasLeft, vm.ErrExecutionReverted
 		}
 		// Preserve behavior with old versions which would zero out gas on this type of error
@@ -779,6 +829,9 @@ func (p *Precompile) Get4ByteMethodSignatures() [][4]byte {
 	for sig := range p.methods {
 		ret = append(ret, sig)
 	}
+	sort.Slice(ret, func(i, j int) bool {
+		return bytes.Compare(ret[i][:], ret[j][:]) < 0
+	})
 	return ret
 }
 

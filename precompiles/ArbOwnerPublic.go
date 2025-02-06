@@ -5,6 +5,7 @@ package precompiles
 
 import (
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 // ArbOwnerPublic precompile provides non-owners with info about the current chain owners.
@@ -42,8 +43,26 @@ func (con ArbOwnerPublic) GetNetworkFeeAccount(c ctx, evm mech) (addr, error) {
 
 // GetInfraFeeAccount gets the infrastructure fee collector
 func (con ArbOwnerPublic) GetInfraFeeAccount(c ctx, evm mech) (addr, error) {
-	if c.State.ArbOSVersion() < 6 {
+	if c.State.ArbOSVersion() < params.ArbosVersion_6 {
 		return c.State.NetworkFeeAccount()
 	}
 	return c.State.InfraFeeAccount()
+}
+
+// GetBrotliCompressionLevel gets the current brotli compression level used for fast compression
+func (con ArbOwnerPublic) GetBrotliCompressionLevel(c ctx, evm mech) (uint64, error) {
+	return c.State.BrotliCompressionLevel()
+}
+
+// GetScheduledUpgrade gets the next scheduled ArbOS version upgrade and its activation timestamp.
+// Returns (0, 0, nil) if no ArbOS upgrade is scheduled.
+func (con ArbOwnerPublic) GetScheduledUpgrade(c ctx, evm mech) (uint64, uint64, error) {
+	version, timestamp, err := c.State.GetScheduledUpgrade()
+	if err != nil {
+		return 0, 0, err
+	}
+	if c.State.ArbOSVersion() >= version {
+		return 0, 0, nil
+	}
+	return version, timestamp, nil
 }

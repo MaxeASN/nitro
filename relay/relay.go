@@ -7,16 +7,14 @@ import (
 	"context"
 	"errors"
 	"net"
-	"time"
 
 	flag "github.com/spf13/pflag"
-
-	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/offchainlabs/nitro/arbutil"
 	"github.com/offchainlabs/nitro/broadcastclient"
 	"github.com/offchainlabs/nitro/broadcastclients"
 	"github.com/offchainlabs/nitro/broadcaster"
+	m "github.com/offchainlabs/nitro/broadcaster/message"
 	"github.com/offchainlabs/nitro/cmd/genericconf"
 	"github.com/offchainlabs/nitro/cmd/util/confighelpers"
 	"github.com/offchainlabs/nitro/util/sharedmetrics"
@@ -29,14 +27,14 @@ type Relay struct {
 	broadcastClients            *broadcastclients.BroadcastClients
 	broadcaster                 *broadcaster.Broadcaster
 	confirmedSequenceNumberChan chan arbutil.MessageIndex
-	messageChan                 chan broadcaster.BroadcastFeedMessage
+	messageChan                 chan m.BroadcastFeedMessage
 }
 
 type MessageQueue struct {
-	queue chan broadcaster.BroadcastFeedMessage
+	queue chan m.BroadcastFeedMessage
 }
 
-func (q *MessageQueue) AddBroadcastMessages(feedMessages []*broadcaster.BroadcastFeedMessage) error {
+func (q *MessageQueue) AddBroadcastMessages(feedMessages []*m.BroadcastFeedMessage) error {
 	for _, feedMessage := range feedMessages {
 		q.queue <- *feedMessage
 	}
@@ -46,7 +44,7 @@ func (q *MessageQueue) AddBroadcastMessages(feedMessages []*broadcaster.Broadcas
 
 func NewRelay(config *Config, feedErrChan chan error) (*Relay, error) {
 
-	q := MessageQueue{make(chan broadcaster.BroadcastFeedMessage, config.Queue)}
+	q := MessageQueue{make(chan m.BroadcastFeedMessage, config.Queue)}
 
 	confirmedSequenceNumberListener := make(chan arbutil.MessageIndex, config.Queue)
 
@@ -77,9 +75,6 @@ func NewRelay(config *Config, feedErrChan chan error) (*Relay, error) {
 	}, nil
 }
 
-const RECENT_FEED_ITEM_TTL = time.Second * 10
-const RECENT_FEED_INITIAL_MAP_SIZE = 1024
-
 func (r *Relay) Start(ctx context.Context) error {
 	r.StopWaiter.Start(ctx, r)
 	err := r.broadcaster.Initialize()
@@ -93,35 +88,16 @@ func (r *Relay) Start(ctx context.Context) error {
 
 	r.broadcastClients.Start(ctx)
 
-	var lastConfirmed arbutil.MessageIndex
-	recentFeedItemsNew := make(map[arbutil.MessageIndex]time.Time, RECENT_FEED_INITIAL_MAP_SIZE)
-	recentFeedItemsOld := make(map[arbutil.MessageIndex]time.Time, RECENT_FEED_INITIAL_MAP_SIZE)
 	r.LaunchThread(func(ctx context.Context) {
-		recentFeedItemsCleanup := time.NewTicker(RECENT_FEED_ITEM_TTL)
-		defer recentFeedItemsCleanup.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case msg := <-r.messageChan:
-				if _, ok := recentFeedItemsNew[msg.SequenceNumber]; ok {
-					continue
-				}
-				if _, ok := recentFeedItemsOld[msg.SequenceNumber]; ok {
-					continue
-				}
-				recentFeedItemsNew[msg.SequenceNumber] = time.Now()
 				sharedmetrics.UpdateSequenceNumberGauge(msg.SequenceNumber)
 				r.broadcaster.BroadcastSingleFeedMessage(&msg)
 			case cs := <-r.confirmedSequenceNumberChan:
-				if lastConfirmed == cs {
-					continue
-				}
 				r.broadcaster.Confirm(cs)
-			case <-recentFeedItemsCleanup.C:
-				// Cycle buckets to get rid of old entries
-				recentFeedItemsOld = recentFeedItemsNew
-				recentFeedItemsNew = make(map[arbutil.MessageIndex]time.Time, RECENT_FEED_INITIAL_MAP_SIZE)
 			}
 		}
 	})
@@ -142,7 +118,7 @@ func (r *Relay) StopAndWait() {
 type Config struct {
 	Conf          genericconf.ConfConfig          `koanf:"conf"`
 	Chain         L2Config                        `koanf:"chain"`
-	LogLevel      int                             `koanf:"log-level"`
+	LogLevel      string                          `koanf:"log-level"`
 	LogType       string                          `koanf:"log-type"`
 	Metrics       bool                            `koanf:"metrics"`
 	MetricsServer genericconf.MetricsServerConfig `koanf:"metrics-server"`
@@ -155,7 +131,7 @@ type Config struct {
 var ConfigDefault = Config{
 	Conf:          genericconf.ConfConfigDefault,
 	Chain:         L2ConfigDefault,
-	LogLevel:      int(log.LvlInfo),
+	LogLevel:      "INFO",
 	LogType:       "plaintext",
 	Metrics:       false,
 	MetricsServer: genericconf.MetricsServerConfigDefault,
@@ -168,7 +144,7 @@ var ConfigDefault = Config{
 func ConfigAddOptions(f *flag.FlagSet) {
 	genericconf.ConfConfigAddOptions("conf", f)
 	L2ConfigAddOptions("chain", f)
-	f.Int("log-level", ConfigDefault.LogLevel, "log level")
+	f.String("log-level", ConfigDefault.LogLevel, "log level, valid values are CRIT, ERROR, WARN, INFO, DEBUG, TRACE")
 	f.String("log-type", ConfigDefault.LogType, "log type")
 	f.Bool("metrics", ConfigDefault.Metrics, "enable metrics")
 	genericconf.MetricsServerAddOptions("metrics-server", f)

@@ -6,20 +6,23 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/offchainlabs/nitro/arbutil"
 )
 
-const CHOSENSEQ_KEY string = "coordinator.chosen"                 // Never overwritten. Expires or released only
-const MSG_COUNT_KEY string = "coordinator.msgCount"               // Only written by sequencer holding CHOSEN key
-const PRIORITIES_KEY string = "coordinator.priorities"            // Read only
-const WANTS_LOCKOUT_KEY_PREFIX string = "coordinator.liveliness." // Per server. Only written by self
-const MESSAGE_KEY_PREFIX string = "coordinator.msg."              // Per Message. Only written by sequencer holding CHOSEN
-const SIGNATURE_KEY_PREFIX string = "coordinator.msg.sig."        // Per Message. Only written by sequencer holding CHOSEN
+const CHOSENSEQ_KEY string = "coordinator.chosen"                      // Never overwritten. Expires or released only
+const MSG_COUNT_KEY string = "coordinator.msgCount"                    // Only written by sequencer holding CHOSEN key
+const FINALIZED_MSG_COUNT_KEY string = "coordinator.finalizedMsgCount" // Only written by sequencer holding CHOSEN key
+const PRIORITIES_KEY string = "coordinator.priorities"                 // Read only
+const WANTS_LOCKOUT_KEY_PREFIX string = "coordinator.liveliness."      // Per server. Only written by self
+const MESSAGE_KEY_PREFIX string = "coordinator.msg."                   // Per Message. Only written by sequencer holding CHOSEN
+const SIGNATURE_KEY_PREFIX string = "coordinator.msg.sig."             // Per Message. Only written by sequencer holding CHOSEN
+const BLOCKMETADATA_KEY_PREFIX string = "coordinator.blockMetadata."   // Per Message. Only written by sequencer holding CHOSEN
 const WANTS_LOCKOUT_VAL string = "OK"
+const SWITCHED_REDIS string = "SWITCHED_REDIS"
 const INVALID_VAL string = "INVALID"
 const INVALID_URL string = "<?INVALID-URL?>"
 
@@ -79,21 +82,29 @@ func (c *RedisCoordinator) CurrentChosenSequencer(ctx context.Context) (string, 
 // GetPriorities returns the priority list of sequencers
 func (rc *RedisCoordinator) GetPriorities(ctx context.Context) ([]string, error) {
 	prioritiesString, err := rc.Client.Get(ctx, PRIORITIES_KEY).Result()
+	if errors.Is(err, redis.Nil) {
+		return []string{}, nil
+	}
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			err = errors.New("sequencer priorities unset")
-		}
 		return []string{}, err
 	}
 	prioritiesList := strings.Split(prioritiesString, ",")
 	return prioritiesList, nil
 }
 
-// GetLiveliness returns a map whose keys are sequencers that have their liveliness set to OK
+// GetLiveliness returns a list of sequencers that have their liveliness set to OK
 func (rc *RedisCoordinator) GetLiveliness(ctx context.Context) ([]string, error) {
-	livelinessList, _, err := rc.Client.Scan(ctx, 0, WANTS_LOCKOUT_KEY_PREFIX+"*", 0).Result()
-	if err != nil {
-		return []string{}, err
+	var livelinessList []string
+	cursor := uint64(0)
+	for {
+		keySlice, cursor, err := rc.Client.Scan(ctx, cursor, WANTS_LOCKOUT_KEY_PREFIX+"*", 0).Result()
+		if err != nil {
+			return []string{}, err
+		}
+		livelinessList = append(livelinessList, keySlice...)
+		if cursor == 0 {
+			break
+		}
 	}
 	for i, elem := range livelinessList {
 		url := strings.TrimPrefix(elem, WANTS_LOCKOUT_KEY_PREFIX)
@@ -108,4 +119,8 @@ func MessageKeyFor(pos arbutil.MessageIndex) string {
 
 func MessageSigKeyFor(pos arbutil.MessageIndex) string {
 	return fmt.Sprintf("%s%d", SIGNATURE_KEY_PREFIX, pos)
+}
+
+func BlockMetadataKeyFor(pos arbutil.MessageIndex) string {
+	return fmt.Sprintf("%s%d", BLOCKMETADATA_KEY_PREFIX, pos)
 }

@@ -6,28 +6,32 @@ package conf
 import (
 	"time"
 
-	"github.com/offchainlabs/nitro/cmd/genericconf"
-	"github.com/offchainlabs/nitro/util/rpcclient"
 	flag "github.com/spf13/pflag"
+
+	"github.com/offchainlabs/nitro/cmd/genericconf"
+	"github.com/offchainlabs/nitro/util/headerreader"
+	"github.com/offchainlabs/nitro/util/rpcclient"
 )
 
-type L1Config struct {
-	ID         uint64                   `koanf:"id"`
-	Connection rpcclient.ClientConfig   `koanf:"connection" reload:"hot"`
-	Wallet     genericconf.WalletConfig `koanf:"wallet"`
+type ParentChainConfig struct {
+	ID         uint64                        `koanf:"id"`
+	Connection rpcclient.ClientConfig        `koanf:"connection" reload:"hot"`
+	BlobClient headerreader.BlobClientConfig `koanf:"blob-client"`
 }
 
 var L1ConnectionConfigDefault = rpcclient.ClientConfig{
-	URL:            "",
-	Retries:        2,
-	Timeout:        time.Minute,
-	ConnectionWait: time.Minute,
+	URL:                       "",
+	Retries:                   2,
+	Timeout:                   time.Minute,
+	ConnectionWait:            time.Minute,
+	ArgLogLimit:               2048,
+	WebsocketMessageSizeLimit: 256 * 1024 * 1024,
 }
 
-var L1ConfigDefault = L1Config{
+var L1ConfigDefault = ParentChainConfig{
 	ID:         0,
 	Connection: L1ConnectionConfigDefault,
-	Wallet:     DefaultL1WalletConfig,
+	BlobClient: headerreader.DefaultBlobClientConfig,
 }
 
 var DefaultL1WalletConfig = genericconf.WalletConfig{
@@ -41,35 +45,27 @@ var DefaultL1WalletConfig = genericconf.WalletConfig{
 func L1ConfigAddOptions(prefix string, f *flag.FlagSet) {
 	f.Uint64(prefix+".id", L1ConfigDefault.ID, "if set other than 0, will be used to validate database and L1 connection")
 	rpcclient.RPCClientAddOptions(prefix+".connection", f, &L1ConfigDefault.Connection)
-	genericconf.WalletConfigAddOptions(prefix+".wallet", f, L1ConfigDefault.Wallet.Pathname)
+	headerreader.BlobClientAddOptions(prefix+".blob-client", f)
 }
 
-func (c *L1Config) ResolveDirectoryNames(chain string) {
-	c.Wallet.ResolveDirectoryNames(chain)
-}
-
-func (c *L1Config) Validate() error {
+func (c *ParentChainConfig) Validate() error {
 	return c.Connection.Validate()
 }
 
 type L2Config struct {
-	ID                   uint64                   `koanf:"id"`
-	Name                 string                   `koanf:"name"`
-	InfoFiles            []string                 `koanf:"info-files"`
-	InfoJson             string                   `koanf:"info-json"`
-	DevWallet            genericconf.WalletConfig `koanf:"dev-wallet"`
-	InfoIpfsUrl          string                   `koanf:"info-ipfs-url"`
-	InfoIpfsDownloadPath string                   `koanf:"info-ipfs-download-path"`
+	ID        uint64                   `koanf:"id"`
+	Name      string                   `koanf:"name"`
+	InfoFiles []string                 `koanf:"info-files"`
+	InfoJson  string                   `koanf:"info-json"`
+	DevWallet genericconf.WalletConfig `koanf:"dev-wallet"`
 }
 
 var L2ConfigDefault = L2Config{
-	ID:                   0,
-	Name:                 "",
-	InfoFiles:            []string{}, // Default file used is chaininfo/arbitrum_chain_info.json, stored in DefaultChainInfo in chain_info.go
-	InfoJson:             "",
-	DevWallet:            genericconf.WalletConfigDefault,
-	InfoIpfsUrl:          "",
-	InfoIpfsDownloadPath: "/tmp/",
+	ID:        0,
+	Name:      "",
+	InfoFiles: []string{}, // Default file used is chaininfo/arbitrum_chain_info.json, stored in DefaultChainInfo in chain_info.go
+	InfoJson:  "",
+	DevWallet: genericconf.WalletConfigDefault,
 }
 
 func L2ConfigAddOptions(prefix string, f *flag.FlagSet) {
@@ -80,9 +76,6 @@ func L2ConfigAddOptions(prefix string, f *flag.FlagSet) {
 
 	// Dev wallet does not exist unless specified
 	genericconf.WalletConfigAddOptions(prefix+".dev-wallet", f, "")
-	f.String(prefix+".info-ipfs-url", L2ConfigDefault.InfoIpfsUrl, "url to download chain info file")
-	f.String(prefix+".info-ipfs-download-path", L2ConfigDefault.InfoIpfsDownloadPath, "path to save temp downloaded file")
-
 }
 
 func (c *L2Config) ResolveDirectoryNames(chain string) {

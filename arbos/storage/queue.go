@@ -4,9 +4,9 @@
 package storage
 
 import (
-	"github.com/offchainlabs/nitro/arbos/util"
-
 	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/offchainlabs/nitro/arbos/util"
 )
 
 type Queue struct {
@@ -25,7 +25,7 @@ func InitializeQueue(sto *Storage) error {
 
 func OpenQueue(sto *Storage) *Queue {
 	return &Queue{
-		sto,
+		sto.WithoutCache(),
 		sto.OpenStorageBackedUint64(0),
 		sto.OpenStorageBackedUint64(1),
 	}

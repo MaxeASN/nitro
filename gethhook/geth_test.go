@@ -20,6 +20,7 @@ import (
 	"github.com/offchainlabs/nitro/arbos/arbosState"
 	"github.com/offchainlabs/nitro/arbos/arbostypes"
 	"github.com/offchainlabs/nitro/arbos/util"
+	"github.com/offchainlabs/nitro/cmd/chaininfo"
 	"github.com/offchainlabs/nitro/util/testhelpers"
 )
 
@@ -49,7 +50,7 @@ var testChainConfig = &params.ChainConfig{
 	MuirGlacierBlock:    big.NewInt(0),
 	BerlinBlock:         big.NewInt(0),
 	LondonBlock:         big.NewInt(0),
-	ArbitrumChainParams: params.ArbitrumDevTestParams(),
+	ArbitrumChainParams: chaininfo.ArbitrumDevTestParams(),
 }
 
 func TestEthDepositMessage(t *testing.T) {
@@ -110,7 +111,7 @@ func TestEthDepositMessage(t *testing.T) {
 
 	RunMessagesThroughAPI(t, [][]byte{serialized, serialized2}, statedb)
 
-	balanceAfter := statedb.GetBalance(addr)
+	balanceAfter := statedb.GetBalance(addr).ToBig()
 	if balanceAfter.Cmp(new(big.Int).Add(balance.Big(), balance2.Big())) != 0 {
 		Fail(t)
 	}
@@ -123,7 +124,7 @@ func RunMessagesThroughAPI(t *testing.T, msgs [][]byte, statedb *state.StateDB) 
 		if err != nil {
 			t.Error(err)
 		}
-		txes, err := arbos.ParseL2Transactions(msg, chainId, nil)
+		txes, err := arbos.ParseL2Transactions(msg, chainId)
 		if err != nil {
 			t.Error(err)
 		}

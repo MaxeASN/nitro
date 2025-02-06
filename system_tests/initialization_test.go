@@ -10,8 +10,8 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/params"
-	"github.com/offchainlabs/nitro/arbnode"
+
+	"github.com/offchainlabs/nitro/cmd/chaininfo"
 	"github.com/offchainlabs/nitro/statetransfer"
 	"github.com/offchainlabs/nitro/util/testhelpers"
 )
@@ -22,14 +22,15 @@ func InitOneContract(prand *testhelpers.PseudoRandomDataSource) (*statetransfer.
 	storageMap := make(map[common.Hash]common.Hash)
 	code := []byte{0x60, 0x0} // PUSH1 0
 	sum := big.NewInt(0)
+	// #nosec G115
 	numCells := int(prand.GetUint64() % 1000)
 	for i := 0; i < numCells; i++ {
 		storageAddr := prand.GetHash()
-		storageVal := prand.GetAddress().Hash() // 20 bytes so sum won't overflow
-		code = append(code, 0x7f)               // PUSH32
-		code = append(code, storageAddr[:]...)  // storageAdr
-		code = append(code, 0x54)               // SLOAD
-		code = append(code, 0x01)               // ADD
+		storageVal := common.BytesToHash(prand.GetAddress().Bytes()) // 20 bytes so sum won't overflow
+		code = append(code, 0x7f)                                    // PUSH32
+		code = append(code, storageAddr[:]...)                       // storageAdr
+		code = append(code, 0x54)                                    // SLOAD
+		code = append(code, 0x01)                                    // ADD
 		storageMap[storageAddr] = storageVal
 		sum.Add(sum, storageVal.Big())
 	}
@@ -50,7 +51,7 @@ func TestInitContract(t *testing.T) {
 	defer cancel()
 	expectedSums := make(map[common.Address]*big.Int)
 	prand := testhelpers.NewPseudoRandomDataSource(t, 1)
-	l2info := NewArbTestInfo(t, params.ArbitrumDevTestChainConfig().ChainID)
+	l2info := NewArbTestInfo(t, chaininfo.ArbitrumDevTestChainConfig().ChainID)
 	for i := 0; i < 50; i++ {
 		contractData, sum := InitOneContract(prand)
 		accountAddress := prand.GetAddress()
@@ -63,14 +64,16 @@ func TestInitContract(t *testing.T) {
 		l2info.ArbInitData.Accounts = append(l2info.ArbInitData.Accounts, accountInfo)
 		expectedSums[accountAddress] = sum
 	}
-	_, node, client := CreateTestL2WithConfig(t, ctx, l2info, arbnode.ConfigDefaultL2Test(), true)
-	defer node.StopAndWait()
+	builder := NewNodeBuilder(ctx).DefaultConfig(t, false)
+	builder.L2Info = l2info
+	cleanup := builder.Build(t)
+	defer cleanup()
 
 	for accountAddress, sum := range expectedSums {
 		msg := ethereum.CallMsg{
 			To: &accountAddress,
 		}
-		res, err := client.CallContract(ctx, msg, big.NewInt(0))
+		res, err := builder.L2.Client.CallContract(ctx, msg, big.NewInt(0))
 		Require(t, err)
 		resBig := new(big.Int).SetBytes(res)
 		if resBig.Cmp(sum) != 0 {

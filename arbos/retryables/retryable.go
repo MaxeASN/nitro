@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+
 	"github.com/offchainlabs/nitro/arbos/storage"
 	"github.com/offchainlabs/nitro/arbos/util"
 	"github.com/offchainlabs/nitro/util/arbmath"
@@ -31,13 +32,13 @@ var (
 )
 
 func InitializeRetryableState(sto *storage.Storage) error {
-	return storage.InitializeQueue(sto.OpenSubStorage(timeoutQueueKey))
+	return storage.InitializeQueue(sto.OpenCachedSubStorage(timeoutQueueKey))
 }
 
 func OpenRetryableState(sto *storage.Storage, statedb vm.StateDB) *RetryableState {
 	return &RetryableState{
 		sto,
-		storage.OpenQueue(sto.OpenSubStorage(timeoutQueueKey)),
+		storage.OpenQueue(sto.OpenCachedSubStorage(timeoutQueueKey)),
 	}
 }
 
@@ -145,11 +146,12 @@ func (rs *RetryableState) DeleteRetryable(id common.Hash, evm *vm.EVM, scenario 
 	escrowAddress := RetryableEscrowAddress(id)
 	beneficiaryAddress := common.BytesToAddress(beneficiary[:])
 	amount := evm.StateDB.GetBalance(escrowAddress)
-	err = util.TransferBalance(&escrowAddress, &beneficiaryAddress, amount, evm, scenario, "escrow")
+	err = util.TransferBalance(&escrowAddress, &beneficiaryAddress, amount.ToBig(), evm, scenario, "escrow")
 	if err != nil {
 		return false, err
 	}
 
+	// we ignore returned error as we expect that if one ClearByUint64 fails, than all consecutive calls to ClearByUint64 will fail with the same error (not modifying state), and then ClearBytes will also fail with the same error (also not modifying state) - and this one we check and return
 	_ = retStorage.ClearByUint64(numTriesOffset)
 	_ = retStorage.ClearByUint64(fromOffset)
 	_ = retStorage.ClearByUint64(toOffset)
@@ -366,5 +368,7 @@ func RetryableEscrowAddress(ticketId common.Hash) common.Address {
 }
 
 func RetryableSubmissionFee(calldataLengthInBytes int, l1BaseFee *big.Int) *big.Int {
-	return arbmath.BigMulByUint(l1BaseFee, uint64(1400+6*calldataLengthInBytes))
+	// This can't overflow because calldataLengthInBytes would need to be 3 exabytes
+	// #nosec G115
+	return arbmath.BigMulByUint(l1BaseFee, 1400+6*uint64(calldataLengthInBytes))
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	_ "net/http/pprof" // #nosec G108
 	"os"
 	"os/signal"
@@ -20,7 +21,7 @@ import (
 
 	"github.com/offchainlabs/nitro/cmd/genericconf"
 	"github.com/offchainlabs/nitro/cmd/util/confighelpers"
-	_ "github.com/offchainlabs/nitro/nodeInterface"
+	_ "github.com/offchainlabs/nitro/execution/nodeInterface"
 	"github.com/offchainlabs/nitro/validator/valnode"
 )
 
@@ -66,6 +67,8 @@ func mainImpl() int {
 	}
 	stackConf := DefaultValidationNodeStackConfig
 	stackConf.DataDir = "" // ephemeral
+	stackConf.HTTPBodyLimit = math.MaxInt
+	stackConf.WSReadLimit = math.MaxInt64
 	nodeConfig.HTTP.Apply(&stackConf)
 	nodeConfig.WS.Apply(&stackConf)
 	nodeConfig.Auth.Apply(&stackConf)
@@ -73,8 +76,8 @@ func mainImpl() int {
 	stackConf.P2P.ListenAddr = ""
 	stackConf.P2P.NoDial = true
 	stackConf.P2P.NoDiscovery = true
-	vcsRevision, vcsTime := confighelpers.GetVersion()
-	stackConf.Version = vcsRevision
+	vcsRevision, strippedRevision, vcsTime := confighelpers.GetVersion()
+	stackConf.Version = strippedRevision
 
 	pathResolver := func(workdir string) func(string) string {
 		if workdir == "" {
@@ -91,7 +94,7 @@ func mainImpl() int {
 		}
 	}
 
-	err = genericconf.InitLog(nodeConfig.LogType, log.Lvl(nodeConfig.LogLevel), &nodeConfig.FileLogging, pathResolver(nodeConfig.Persistent.LogDir))
+	err = genericconf.InitLog(nodeConfig.LogType, nodeConfig.LogLevel, &nodeConfig.FileLogging, pathResolver(nodeConfig.Persistent.LogDir))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing logging: %v\n", err)
 		return 1
@@ -110,7 +113,7 @@ func mainImpl() int {
 	liveNodeConfig := genericconf.NewLiveConfig[*ValidationNodeConfig](args, nodeConfig, ParseNode)
 	liveNodeConfig.SetOnReloadHook(func(oldCfg *ValidationNodeConfig, newCfg *ValidationNodeConfig) error {
 
-		return genericconf.InitLog(newCfg.LogType, log.Lvl(newCfg.LogLevel), &newCfg.FileLogging, pathResolver(nodeConfig.Persistent.LogDir))
+		return genericconf.InitLog(newCfg.LogType, newCfg.LogLevel, &newCfg.FileLogging, pathResolver(nodeConfig.Persistent.LogDir))
 	})
 
 	valnode.EnsureValidationExposedViaAuthRPC(&stackConf)
@@ -122,7 +125,7 @@ func mainImpl() int {
 	}
 
 	if err := startMetrics(nodeConfig); err != nil {
-		log.Error("Starting metrics: %v", err)
+		log.Error("Error starting metrics", "error", err)
 		return 1
 	}
 

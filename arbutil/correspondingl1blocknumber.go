@@ -1,4 +1,4 @@
-// Copyright 2021-2022, Offchain Labs, Inc.
+// Copyright 2021-2024, Offchain Labs, Inc.
 // For license information, see https://github.com/nitro/blob/master/LICENSE
 
 package arbutil
@@ -19,7 +19,12 @@ func ParentHeaderToL1BlockNumber(header *types.Header) uint64 {
 	return header.Number.Uint64()
 }
 
-func CorrespondingL1BlockNumber(ctx context.Context, client L1Interface, parentBlockNumber uint64) (uint64, error) {
+type ParentHeaderFetcher interface {
+	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
+}
+
+func CorrespondingL1BlockNumber(ctx context.Context, client ParentHeaderFetcher, parentBlockNumber uint64) (uint64, error) {
+	// #nosec G115
 	header, err := client.HeaderByNumber(ctx, big.NewInt(int64(parentBlockNumber)))
 	if err != nil {
 		return 0, fmt.Errorf("error getting L1 block number %d header : %w", parentBlockNumber, err)

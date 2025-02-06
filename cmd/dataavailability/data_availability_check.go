@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	flag "github.com/spf13/pflag"
+
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -21,14 +23,12 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rpc"
 
-	"github.com/offchainlabs/nitro/arbstate"
+	"github.com/offchainlabs/nitro/arbstate/daprovider"
 	"github.com/offchainlabs/nitro/cmd/util/confighelpers"
 	"github.com/offchainlabs/nitro/das"
 	"github.com/offchainlabs/nitro/solgen/go/bridgegen"
 	"github.com/offchainlabs/nitro/util/metricsutil"
 	"github.com/offchainlabs/nitro/util/stopwaiter"
-
-	flag "github.com/spf13/pflag"
 )
 
 // Data availability check is done to as to make sure that the data that is being stored by DAS is available at all time.
@@ -65,7 +65,7 @@ type DataAvailabilityCheck struct {
 	config         *DataAvailabilityCheckConfig
 	inboxAddr      *common.Address
 	inboxContract  *bridgegen.SequencerInbox
-	urlToReaderMap map[string]arbstate.DataAvailabilityReader
+	urlToReaderMap map[string]daprovider.DASReader
 	checkInterval  time.Duration
 }
 
@@ -86,7 +86,7 @@ func newDataAvailabilityCheck(ctx context.Context, dataAvailabilityCheckConfig *
 	if err != nil {
 		return nil, err
 	}
-	urlToReaderMap := make(map[string]arbstate.DataAvailabilityReader, len(onlineUrls))
+	urlToReaderMap := make(map[string]daprovider.DASReader, len(onlineUrls))
 	for _, url := range onlineUrls {
 		reader, err := das.NewRestfulDasClientFromURL(url)
 		if err != nil {
@@ -238,7 +238,7 @@ func (d *DataAvailabilityCheck) checkDataAvailability(ctx context.Context, deliv
 	if data == nil {
 		return false, nil
 	}
-	cert, err := arbstate.DeserializeDASCertFrom(bytes.NewReader(data))
+	cert, err := daprovider.DeserializeDASCertFrom(bytes.NewReader(data))
 	if err != nil {
 		return true, err
 	}

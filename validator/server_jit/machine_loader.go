@@ -7,26 +7,30 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/offchainlabs/nitro/validator/server_common"
 )
 
 type JitMachineConfig struct {
-	ProverBinPath string
-	JitCranelift  bool
+	ProverBinPath        string
+	JitCranelift         bool
+	WasmMemoryUsageLimit int
 }
 
 var DefaultJitMachineConfig = JitMachineConfig{
-	JitCranelift:  true,
-	ProverBinPath: "replay.wasm",
+	JitCranelift:         true,
+	ProverBinPath:        "replay.wasm",
+	WasmMemoryUsageLimit: 4294967296,
 }
 
 func getJitPath() (string, error) {
 	var jitBinary string
 	executable, err := os.Executable()
 	if err == nil {
-		if strings.Contains(filepath.Base(executable), "test") {
+		if strings.Contains(filepath.Base(executable), "test") || strings.Contains(filepath.Dir(executable), "system_tests") {
 			_, thisfile, _, _ := runtime.Caller(0)
 			projectDir := filepath.Dir(filepath.Dir(filepath.Dir(thisfile)))
 			jitBinary = filepath.Join(projectDir, "target", "bin", "jit")
@@ -50,14 +54,14 @@ type JitMachineLoader struct {
 	stopped bool
 }
 
-func NewJitMachineLoader(config *JitMachineConfig, locator *server_common.MachineLocator, fatalErrChan chan error) (*JitMachineLoader, error) {
+func NewJitMachineLoader(config *JitMachineConfig, locator *server_common.MachineLocator, maxExecutionTime time.Duration, fatalErrChan chan error) (*JitMachineLoader, error) {
 	jitPath, err := getJitPath()
 	if err != nil {
 		return nil, err
 	}
 	createMachineThreadFunc := func(ctx context.Context, moduleRoot common.Hash) (*JitMachine, error) {
 		binPath := filepath.Join(locator.GetMachinePath(moduleRoot), config.ProverBinPath)
-		return createJitMachine(jitPath, binPath, config.JitCranelift, moduleRoot, fatalErrChan)
+		return createJitMachine(jitPath, binPath, config.JitCranelift, config.WasmMemoryUsageLimit, maxExecutionTime, moduleRoot, fatalErrChan)
 	}
 	return &JitMachineLoader{
 		MachineLoader: *server_common.NewMachineLoader[JitMachine](locator, createMachineThreadFunc),

@@ -9,18 +9,16 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
+
 	"github.com/offchainlabs/nitro/arbos/arbostypes"
 	"github.com/offchainlabs/nitro/arbos/util"
 	"github.com/offchainlabs/nitro/util/arbmath"
 )
 
-type InfallibleBatchFetcher func(batchNum uint64, batchHash common.Hash) []byte
-
-func ParseL2Transactions(msg *arbostypes.L1IncomingMessage, chainId *big.Int, batchFetcher InfallibleBatchFetcher) (types.Transactions, error) {
+func ParseL2Transactions(msg *arbostypes.L1IncomingMessage, chainId *big.Int) (types.Transactions, error) {
 	if len(msg.L2msg) > arbostypes.MaxL2MessageSize {
 		// ignore the message if l2msg is too large
 		return nil, errors.New("message too large")
@@ -40,8 +38,8 @@ func ParseL2Transactions(msg *arbostypes.L1IncomingMessage, chainId *big.Int, ba
 			return nil, errors.New("cannot issue L2 funded by L1 tx without L1 request id")
 		}
 		kind := msg.L2msg[0]
-		depositRequestId := crypto.Keccak256Hash(msg.Header.RequestId[:], math.U256Bytes(common.Big0))
-		unsignedRequestId := crypto.Keccak256Hash(msg.Header.RequestId[:], math.U256Bytes(common.Big1))
+		depositRequestId := crypto.Keccak256Hash(msg.Header.RequestId[:], arbmath.U256Bytes(common.Big0))
+		unsignedRequestId := crypto.Keccak256Hash(msg.Header.RequestId[:], arbmath.U256Bytes(common.Big1))
 		tx, err := parseUnsignedTx(bytes.NewReader(msg.L2msg[1:]), msg.Header.Poster, &unsignedRequestId, chainId, kind)
 		if err != nil {
 			return nil, err
@@ -72,7 +70,7 @@ func ParseL2Transactions(msg *arbostypes.L1IncomingMessage, chainId *big.Int, ba
 		log.Debug("ignoring rollup event message")
 		return types.Transactions{}, nil
 	case arbostypes.L1MessageType_BatchPostingReport:
-		tx, err := parseBatchPostingReportMessage(bytes.NewReader(msg.L2msg), chainId, msg.BatchGasCost, batchFetcher)
+		tx, err := parseBatchPostingReportMessage(bytes.NewReader(msg.L2msg), chainId, msg.BatchGasCost)
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +144,7 @@ func parseL2Message(rd io.Reader, poster common.Address, timestamp uint64, reque
 
 			var nextRequestId *common.Hash
 			if requestId != nil {
-				subRequestId := crypto.Keccak256Hash(requestId[:], math.U256Bytes(index))
+				subRequestId := crypto.Keccak256Hash(requestId[:], arbmath.U256Bytes(index))
 				nextRequestId = &subRequestId
 			}
 			nestedSegments, err := parseL2Message(bytes.NewReader(nextMsg), poster, timestamp, nextRequestId, chainId, depth+1)
@@ -166,8 +164,9 @@ func parseL2Message(rd io.Reader, poster common.Address, timestamp uint64, reque
 		if err := newTx.UnmarshalBinary(readBytes); err != nil {
 			return nil, err
 		}
-		if newTx.Type() >= types.ArbitrumDepositTxType {
-			// Should be unreachable due to UnmarshalBinary not accepting Arbitrum internal txs
+		if newTx.Type() >= types.ArbitrumDepositTxType || newTx.Type() == types.BlobTxType {
+			// Should be unreachable for Arbitrum types due to UnmarshalBinary not accepting Arbitrum internal txs
+			// and we want to disallow BlobTxType since Arbitrum doesn't support EIP-4844 txs yet.
 			return nil, types.ErrTxTypeNotSupported
 		}
 		return types.Transactions{newTx}, nil
@@ -370,8 +369,8 @@ func parseSubmitRetryableMessage(rd io.Reader, header *arbostypes.L1IncomingMess
 	return types.NewTx(tx), err
 }
 
-func parseBatchPostingReportMessage(rd io.Reader, chainId *big.Int, msgBatchGasCost *uint64, batchFetcher InfallibleBatchFetcher) (*types.Transaction, error) {
-	batchTimestamp, batchPosterAddr, batchHash, batchNum, l1BaseFee, extraGas, err := arbostypes.ParseBatchPostingReportMessageFields(rd)
+func parseBatchPostingReportMessage(rd io.Reader, chainId *big.Int, msgBatchGasCost *uint64) (*types.Transaction, error) {
+	batchTimestamp, batchPosterAddr, _, batchNum, l1BaseFee, extraGas, err := arbostypes.ParseBatchPostingReportMessageFields(rd)
 	if err != nil {
 		return nil, err
 	}
@@ -379,8 +378,7 @@ func parseBatchPostingReportMessage(rd io.Reader, chainId *big.Int, msgBatchGasC
 	if msgBatchGasCost != nil {
 		batchDataGas = *msgBatchGasCost
 	} else {
-		batchData := batchFetcher(batchNum, batchHash)
-		batchDataGas = arbostypes.ComputeBatchGasCost(batchData)
+		return nil, errors.New("cannot compute batch gas cost")
 	}
 	batchDataGas = arbmath.SaturatingUAdd(batchDataGas, extraGas)
 

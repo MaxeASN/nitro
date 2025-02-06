@@ -2,9 +2,13 @@ package arbtest
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,57 +17,37 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/trie"
-	"github.com/offchainlabs/nitro/arbnode"
+
+	"github.com/offchainlabs/nitro/execution/gethexec"
 	"github.com/offchainlabs/nitro/util"
-	"github.com/offchainlabs/nitro/util/testhelpers"
 )
 
-func prepareNodeWithHistory(t *testing.T, ctx context.Context, maxRecreateStateDepth int64, txCount uint64) (node *arbnode.Node, bc *core.BlockChain, db ethdb.Database, l2client *ethclient.Client, l2info info, cancel func()) {
-	t.Helper()
-	nodeConfig := arbnode.ConfigDefaultL1Test()
-	nodeConfig.RPC.MaxRecreateStateDepth = maxRecreateStateDepth
-	nodeConfig.Sequencer.MaxBlockSpeed = 0
-	nodeConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
-	cacheConfig := &core.CacheConfig{
-		// Arbitrum Config Options
-		TriesInMemory: 128,
-		TrieRetention: 30 * time.Minute,
-
-		// disable caching of states in BlockChain.stateCache
-		TrieCleanLimit: 0,
-		TrieDirtyLimit: 0,
-
-		TrieDirtyDisabled: true,
-
-		TrieTimeLimit: 5 * time.Minute,
-		SnapshotLimit: 256,
-		SnapshotWait:  true,
-	}
-	l2info, node, l2client, _, _, _, _, l1stack := createTestNodeOnL1WithConfigImpl(t, ctx, true, nodeConfig, nil, nil, cacheConfig, nil)
-	cancel = func() {
-		defer requireClose(t, l1stack)
-		defer node.StopAndWait()
-	}
-	l2info.GenerateAccount("User2")
+func makeSomeTransfers(t *testing.T, ctx context.Context, builder *NodeBuilder, txCount uint64) {
 	var txs []*types.Transaction
 	for i := uint64(0); i < txCount; i++ {
-		tx := l2info.PrepareTx("Owner", "User2", l2info.TransferGas, common.Big1, nil)
+		tx := builder.L2Info.PrepareTx("Owner", "User2", builder.L2Info.TransferGas, common.Big1, nil)
 		txs = append(txs, tx)
-		err := l2client.SendTransaction(ctx, tx)
-		testhelpers.RequireImpl(t, err)
+		err := builder.L2.Client.SendTransaction(ctx, tx)
+		Require(t, err)
 	}
 	for _, tx := range txs {
-		_, err := EnsureTxSucceeded(ctx, l2client, tx)
-		testhelpers.RequireImpl(t, err)
+		_, err := builder.L2.EnsureTxSucceeded(tx)
+		Require(t, err)
 	}
-	bc = node.Execution.Backend.ArbInterface().BlockChain()
-	db = node.Execution.Backend.ChainDb()
+}
 
-	return
+func prepareNodeWithHistory(t *testing.T, ctx context.Context, execConfig *gethexec.Config, txCount uint64) (*NodeBuilder, func()) {
+	t.Helper()
+	builder := NewNodeBuilder(ctx).DefaultConfig(t, true)
+	builder.execConfig = execConfig
+	cleanup := builder.Build(t)
+	builder.L2Info.GenerateAccount("User2")
+	makeSomeTransfers(t, ctx, builder, txCount)
+	return builder, cleanup
 }
 
 func fillHeaderCache(t *testing.T, bc *core.BlockChain, from, to uint64) {
@@ -71,7 +55,7 @@ func fillHeaderCache(t *testing.T, bc *core.BlockChain, from, to uint64) {
 	for i := from; i <= to; i++ {
 		header := bc.GetHeaderByNumber(i)
 		if header == nil {
-			testhelpers.FailImpl(t, "internal test error - failed to get header while trying to fill headerCache, header:", i)
+			Fatal(t, "internal test error - failed to get header while trying to fill headerCache, header:", i)
 		}
 	}
 }
@@ -81,7 +65,7 @@ func fillBlockCache(t *testing.T, bc *core.BlockChain, from, to uint64) {
 	for i := from; i <= to; i++ {
 		block := bc.GetBlockByNumber(i)
 		if block == nil {
-			testhelpers.FailImpl(t, "internal test error - failed to get block while trying to fill blockCache, block:", i)
+			Fatal(t, "internal test error - failed to get block while trying to fill blockCache, block:", i)
 		}
 	}
 }
@@ -91,21 +75,21 @@ func removeStatesFromDb(t *testing.T, bc *core.BlockChain, db ethdb.Database, fr
 	for i := from; i <= to; i++ {
 		header := bc.GetHeaderByNumber(i)
 		if header == nil {
-			testhelpers.FailImpl(t, "failed to get last block header")
+			Fatal(t, "failed to get last block header")
 		}
 		hash := header.Root
 		err := db.Delete(hash.Bytes())
-		testhelpers.RequireImpl(t, err)
+		Require(t, err)
 	}
 	for i := from; i <= to; i++ {
 		header := bc.GetHeaderByNumber(i)
 		_, err := bc.StateAt(header.Root)
 		if err == nil {
-			testhelpers.FailImpl(t, "internal test error - failed to remove state from db")
+			Fatal(t, "internal test error - failed to remove state from db")
 		}
 		expectedErr := &trie.MissingNodeError{}
 		if !errors.As(err, &expectedErr) {
-			testhelpers.FailImpl(t, "internal test error - failed to remove state from db, err: ", err)
+			Fatal(t, "internal test error - failed to remove state from db, err: ", err)
 		}
 	}
 }
@@ -113,46 +97,75 @@ func removeStatesFromDb(t *testing.T, bc *core.BlockChain, db ethdb.Database, fr
 func TestRecreateStateForRPCNoDepthLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, bc, db, l2client, _, cancelNode := prepareNodeWithHistory(t, ctx, arbitrum.InfiniteMaxRecreateStateDepth, 32)
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.RPC.MaxRecreateStateDepth = arbitrum.InfiniteMaxRecreateStateDepth
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	execConfig.Caching.StateScheme = rawdb.HashScheme
+	execConfig.Caching.SnapshotCache = 0 // disable snapshots
+	// disable trie/Database.cleans cache, so as states removed from ChainDb won't be cached there
+	execConfig.Caching.TrieCleanCache = 0
+	execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving = 0
+	execConfig.Caching.MaxAmountOfGasToSkipStateSaving = 0
+	builder, cancelNode := prepareNodeWithHistory(t, ctx, execConfig, 32)
 	defer cancelNode()
+	execNode, l2client := builder.L2.ExecNode, builder.L2.Client
+	bc := execNode.Backend.ArbInterface().BlockChain()
+	db := execNode.Backend.ChainDb()
 
 	lastBlock, err := l2client.BlockNumber(ctx)
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 	middleBlock := lastBlock / 2
 
 	expectedBalance, err := l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 
 	removeStatesFromDb(t, bc, db, middleBlock, lastBlock)
 
 	balance, err := l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 	if balance.Cmp(expectedBalance) != 0 {
-		testhelpers.FailImpl(t, "unexpected balance result for last block, want: ", expectedBalance, " have: ", balance)
+		Fatal(t, "unexpected balance result for last block, want: ", expectedBalance, " have: ", balance)
 	}
-
 }
 
 func TestRecreateStateForRPCBigEnoughDepthLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// #nosec G115
 	depthGasLimit := int64(256 * util.NormalizeL2GasForL1GasInitial(800_000, params.GWei))
-	_, bc, db, l2client, _, cancelNode := prepareNodeWithHistory(t, ctx, depthGasLimit, 32)
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.RPC.MaxRecreateStateDepth = depthGasLimit
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	execConfig.Caching.StateScheme = rawdb.HashScheme
+	// disable trie/Database.cleans cache, so as states removed from ChainDb won't be cached there
+	execConfig.Caching.TrieCleanCache = 0
+	execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving = 0
+	execConfig.Caching.MaxAmountOfGasToSkipStateSaving = 0
+	builder, cancelNode := prepareNodeWithHistory(t, ctx, execConfig, 32)
 	defer cancelNode()
+	execNode, l2client := builder.L2.ExecNode, builder.L2.Client
+	bc := execNode.Backend.ArbInterface().BlockChain()
+	db := execNode.Backend.ChainDb()
 
 	lastBlock, err := l2client.BlockNumber(ctx)
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 	middleBlock := lastBlock / 2
 
 	expectedBalance, err := l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 
 	removeStatesFromDb(t, bc, db, middleBlock, lastBlock)
 
 	balance, err := l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 	if balance.Cmp(expectedBalance) != 0 {
-		testhelpers.FailImpl(t, "unexpected balance result for last block, want: ", expectedBalance, " have: ", balance)
+		Fatal(t, "unexpected balance result for last block, want: ", expectedBalance, " have: ", balance)
 	}
 
 }
@@ -160,22 +173,35 @@ func TestRecreateStateForRPCBigEnoughDepthLimit(t *testing.T) {
 func TestRecreateStateForRPCDepthLimitExceeded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	depthGasLimit := int64(200)
-	_, bc, db, l2client, _, cancelNode := prepareNodeWithHistory(t, ctx, depthGasLimit, 32)
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.RPC.MaxRecreateStateDepth = int64(200)
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	execConfig.Caching.StateScheme = rawdb.HashScheme
+	// disable trie/Database.cleans cache, so as states removed from ChainDb won't be cached there
+	execConfig.Caching.TrieCleanCache = 0
+	execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving = 0
+	execConfig.Caching.MaxAmountOfGasToSkipStateSaving = 0
+	builder, cancelNode := prepareNodeWithHistory(t, ctx, execConfig, 32)
 	defer cancelNode()
+	execNode, l2client := builder.L2.ExecNode, builder.L2.Client
+	bc := execNode.Backend.ArbInterface().BlockChain()
+	db := execNode.Backend.ChainDb()
 
 	lastBlock, err := l2client.BlockNumber(ctx)
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 	middleBlock := lastBlock / 2
 
 	removeStatesFromDb(t, bc, db, middleBlock, lastBlock)
 
 	_, err = l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
 	if err == nil {
-		testhelpers.FailImpl(t, "Didn't fail as expected")
+		Fatal(t, "Didn't fail as expected")
 	}
 	if err.Error() != arbitrum.ErrDepthLimitExceeded.Error() {
-		testhelpers.FailImpl(t, "Failed with unexpected error:", err)
+		Fatal(t, "Failed with unexpected error:", err)
 	}
 }
 
@@ -184,13 +210,27 @@ func TestRecreateStateForRPCMissingBlockParent(t *testing.T) {
 	var headerCacheLimit uint64 = 512
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, bc, db, l2client, _, cancelNode := prepareNodeWithHistory(t, ctx, arbitrum.InfiniteMaxRecreateStateDepth, headerCacheLimit+5)
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.RPC.MaxRecreateStateDepth = arbitrum.InfiniteMaxRecreateStateDepth
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	execConfig.Caching.StateScheme = rawdb.HashScheme
+	// disable trie/Database.cleans cache, so as states removed from ChainDb won't be cached there
+	execConfig.Caching.TrieCleanCache = 0
+	execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving = 0
+	execConfig.Caching.MaxAmountOfGasToSkipStateSaving = 0
+	builder, cancelNode := prepareNodeWithHistory(t, ctx, execConfig, headerCacheLimit+5)
 	defer cancelNode()
+	execNode, l2client := builder.L2.ExecNode, builder.L2.Client
+	bc := execNode.Backend.ArbInterface().BlockChain()
+	db := execNode.Backend.ChainDb()
 
 	lastBlock, err := l2client.BlockNumber(ctx)
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 	if lastBlock < headerCacheLimit+4 {
-		testhelpers.FailImpl(t, "Internal test error - not enough blocks produced during preparation, want:", headerCacheLimit, "have:", lastBlock)
+		Fatal(t, "Internal test error - not enough blocks produced during preparation, want:", headerCacheLimit, "have:", lastBlock)
 	}
 
 	removeStatesFromDb(t, bc, db, lastBlock-4, lastBlock)
@@ -206,10 +246,10 @@ func TestRecreateStateForRPCMissingBlockParent(t *testing.T) {
 		_, err = l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(i))
 		if err == nil {
 			hash := rawdb.ReadCanonicalHash(db, i)
-			testhelpers.FailImpl(t, "Didn't fail to get balance at block:", i, " with hash:", hash, ", lastBlock:", lastBlock)
+			Fatal(t, "Didn't fail to get balance at block:", i, " with hash:", hash, ", lastBlock:", lastBlock)
 		}
 		if !strings.Contains(err.Error(), "chain doesn't contain parent of block") {
-			testhelpers.FailImpl(t, "Failed with unexpected error: \"", err, "\", at block:", i, "lastBlock:", lastBlock)
+			Fatal(t, "Failed with unexpected error: \"", err, "\", at block:", i, "lastBlock:", lastBlock)
 		}
 	}
 }
@@ -217,11 +257,26 @@ func TestRecreateStateForRPCMissingBlockParent(t *testing.T) {
 func TestRecreateStateForRPCBeyondGenesis(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, bc, db, l2client, _, cancelNode := prepareNodeWithHistory(t, ctx, arbitrum.InfiniteMaxRecreateStateDepth, 32)
+
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.RPC.MaxRecreateStateDepth = arbitrum.InfiniteMaxRecreateStateDepth
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	execConfig.Caching.StateScheme = rawdb.HashScheme
+	// disable trie/Database.cleans cache, so as states removed from ChainDb won't be cached there
+	execConfig.Caching.TrieCleanCache = 0
+	execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving = 0
+	execConfig.Caching.MaxAmountOfGasToSkipStateSaving = 0
+	builder, cancelNode := prepareNodeWithHistory(t, ctx, execConfig, 32)
+	execNode, l2client := builder.L2.ExecNode, builder.L2.Client
 	defer cancelNode()
+	bc := execNode.Backend.ArbInterface().BlockChain()
+	db := execNode.Backend.ChainDb()
 
 	lastBlock, err := l2client.BlockNumber(ctx)
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 
 	genesis := bc.Config().ArbitrumChainParams.GenesisBlockNum
 	removeStatesFromDb(t, bc, db, genesis, lastBlock)
@@ -229,10 +284,10 @@ func TestRecreateStateForRPCBeyondGenesis(t *testing.T) {
 	_, err = l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
 	if err == nil {
 		hash := rawdb.ReadCanonicalHash(db, lastBlock)
-		testhelpers.FailImpl(t, "Didn't fail to get balance at block:", lastBlock, " with hash:", hash, ", lastBlock:", lastBlock)
+		Fatal(t, "Didn't fail to get balance at block:", lastBlock, " with hash:", hash, ", lastBlock:", lastBlock)
 	}
 	if !strings.Contains(err.Error(), "moved beyond genesis") {
-		testhelpers.FailImpl(t, "Failed with unexpected error: \"", err, "\", at block:", lastBlock, "lastBlock:", lastBlock)
+		Fatal(t, "Failed with unexpected error: \"", err, "\", at block:", lastBlock, "lastBlock:", lastBlock)
 	}
 }
 
@@ -241,13 +296,28 @@ func TestRecreateStateForRPCBlockNotFoundWhileRecreating(t *testing.T) {
 	var blockCacheLimit uint64 = 256
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, bc, db, l2client, _, cancelNode := prepareNodeWithHistory(t, ctx, arbitrum.InfiniteMaxRecreateStateDepth, blockCacheLimit+4)
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.RPC.MaxRecreateStateDepth = arbitrum.InfiniteMaxRecreateStateDepth
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	execConfig.Caching.StateScheme = rawdb.HashScheme
+	// disable trie/Database.cleans cache, so as states removed from ChainDb won't be cached there
+	execConfig.Caching.TrieCleanCache = 0
+
+	execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving = 0
+	execConfig.Caching.MaxAmountOfGasToSkipStateSaving = 0
+	builder, cancelNode := prepareNodeWithHistory(t, ctx, execConfig, blockCacheLimit+4)
+	execNode, l2client := builder.L2.ExecNode, builder.L2.Client
 	defer cancelNode()
+	bc := execNode.Backend.ArbInterface().BlockChain()
+	db := execNode.Backend.ChainDb()
 
 	lastBlock, err := l2client.BlockNumber(ctx)
-	testhelpers.RequireImpl(t, err)
+	Require(t, err)
 	if lastBlock < blockCacheLimit+4 {
-		testhelpers.FailImpl(t, "Internal test error - not enough blocks produced during preparation, want:", blockCacheLimit, "have:", lastBlock)
+		Fatal(t, "Internal test error - not enough blocks produced during preparation, want:", blockCacheLimit, "have:", lastBlock)
 	}
 
 	removeStatesFromDb(t, bc, db, lastBlock-4, lastBlock)
@@ -262,9 +332,370 @@ func TestRecreateStateForRPCBlockNotFoundWhileRecreating(t *testing.T) {
 	_, err = l2client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
 	if err == nil {
 		hash := rawdb.ReadCanonicalHash(db, lastBlock)
-		testhelpers.FailImpl(t, "Didn't fail to get balance at block:", lastBlock, " with hash:", hash, ", lastBlock:", lastBlock)
+		Fatal(t, "Didn't fail to get balance at block:", lastBlock, " with hash:", hash, ", lastBlock:", lastBlock)
 	}
-	if !strings.Contains(err.Error(), "block not found while recreating") {
-		testhelpers.FailImpl(t, "Failed with unexpected error: \"", err, "\", at block:", lastBlock, "lastBlock:", lastBlock)
+	if !strings.Contains(err.Error(), fmt.Sprintf("block #%d not found", blockBodyToRemove)) {
+		Fatal(t, "Failed with unexpected error: \"", err, "\", at block:", lastBlock, "lastBlock:", lastBlock)
+	}
+}
+
+func testSkippingSavingStateAndRecreatingAfterRestart(t *testing.T, cacheConfig *gethexec.CachingConfig, txCount int) {
+	t.Parallel()
+	maxRecreateStateDepth := int64(30 * 1000 * 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.RPC.MaxRecreateStateDepth = maxRecreateStateDepth
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	execConfig.Caching = *cacheConfig
+
+	skipBlocks := execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving
+	skipGas := execConfig.Caching.MaxAmountOfGasToSkipStateSaving
+
+	builder := NewNodeBuilder(ctx).DefaultConfig(t, false)
+	builder.execConfig = execConfig
+	cleanup := builder.Build(t)
+	defer cleanup()
+
+	client := builder.L2.Client
+	l2info := builder.L2Info
+	genesis, err := client.BlockNumber(ctx)
+	Require(t, err)
+
+	l2info.GenerateAccount("User2")
+	// #nosec G115
+	for i := genesis; i < uint64(txCount)+genesis; i++ {
+		tx := l2info.PrepareTx("Owner", "User2", l2info.TransferGas, common.Big1, nil)
+		err := client.SendTransaction(ctx, tx)
+		Require(t, err)
+		receipt, err := EnsureTxSucceeded(ctx, client, tx)
+		Require(t, err)
+		// #nosec G115
+		if have, want := receipt.BlockNumber.Uint64(), uint64(i)+1; have != want {
+			Fatal(t, "internal test error - tx got included in unexpected block number, have:", have, "want:", want)
+		}
+	}
+	bc := builder.L2.ExecNode.Backend.ArbInterface().BlockChain()
+	currentHeader := bc.CurrentBlock()
+	if currentHeader == nil {
+		Fatal(t, "missing current block")
+	}
+	lastBlock := currentHeader.Number.Uint64()
+	// #nosec G115
+	if want := genesis + uint64(txCount); lastBlock < want {
+		Fatal(t, "internal test error - not enough blocks produced during preparation, want:", want, "have:", lastBlock)
+	}
+	expectedBalance, err := client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
+	Require(t, err)
+
+	builder.RestartL2Node(t)
+	t.Log("restarted the node")
+
+	client = builder.L2.Client
+	bc = builder.L2.ExecNode.Backend.ArbInterface().BlockChain()
+	gas := skipGas
+	blocks := skipBlocks
+	// #nosec G115
+	for i := genesis; i <= genesis+uint64(txCount); i++ {
+		block := bc.GetBlockByNumber(i)
+		if block == nil {
+			Fatal(t, "header not found for block number:", i)
+			continue
+		}
+		gas += block.GasUsed()
+		_, err := bc.StateAt(block.Root())
+		blocks++
+		if (skipBlocks == 0 && skipGas == 0) || (skipBlocks != 0 && blocks > skipBlocks) || (skipGas != 0 && gas > skipGas) {
+			if err != nil {
+				t.Log("blocks:", blocks, "skipBlocks:", skipBlocks, "gas:", gas, "skipGas:", skipGas)
+			}
+			Require(t, err, "state not found, root:", block.Root(), "blockNumber:", i, "blockHash", block.Hash(), "err:", err)
+			gas = 0
+			blocks = 0
+		} else {
+			// #nosec G115
+			if int(i) >= int(lastBlock)-int(cacheConfig.BlockCount) {
+				// skipping nonexistence check - the state might have been saved on node shutdown
+				continue
+			}
+			if err == nil {
+				t.Log("blocks:", blocks, "skipBlocks:", skipBlocks, "gas:", gas, "skipGas:", skipGas)
+				Fatal(t, "state shouldn't be available, root:", block.Root(), "blockNumber:", i, "blockHash", block.Hash())
+			}
+			expectedErr := &trie.MissingNodeError{}
+			if !errors.As(err, &expectedErr) {
+				Fatal(t, "getting state failed with unexpected error, root:", block.Root(), "blockNumber:", i, "blockHash:", block.Hash(), "err:", err)
+			}
+		}
+	}
+	// #nosec G115
+	for i := genesis + 1; i <= genesis+uint64(txCount); i += i % 10 {
+		_, err = client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(i))
+		if err != nil {
+			t.Log("skipBlocks:", skipBlocks, "skipGas:", skipGas)
+		}
+		Require(t, err)
+	}
+
+	balance, err := client.BalanceAt(ctx, GetTestAddressForAccountName(t, "User2"), new(big.Int).SetUint64(lastBlock))
+	Require(t, err)
+	if balance.Cmp(expectedBalance) != 0 {
+		Fatal(t, "unexpected balance result for last block, want: ", expectedBalance, " have: ", balance)
+	}
+}
+
+func TestSkippingSavingStateAndRecreatingAfterRestart(t *testing.T) {
+	cacheConfig := TestCachingConfig
+	cacheConfig.Archive = true
+	// For now Archive node should use HashScheme
+	cacheConfig.StateScheme = rawdb.HashScheme
+	cacheConfig.SnapshotCache = 0 // disable snapshots
+	cacheConfig.BlockAge = 0      // use only Caching.BlockCount to keep only last N blocks in dirties cache, no matter how new they are
+
+	runTestCase := func(t *testing.T, cacheConfig gethexec.CachingConfig, txes int) {
+		t.Run(fmt.Sprintf("skip-blocks-%d-skip-gas-%d-txes-%d", cacheConfig.MaxNumberOfBlocksToSkipStateSaving, cacheConfig.MaxAmountOfGasToSkipStateSaving, txes), func(t *testing.T) {
+			testSkippingSavingStateAndRecreatingAfterRestart(t, &cacheConfig, txes)
+		})
+	}
+
+	// test defaults
+	runTestCase(t, cacheConfig, 512)
+
+	cacheConfig.MaxNumberOfBlocksToSkipStateSaving = 127
+	cacheConfig.MaxAmountOfGasToSkipStateSaving = 0
+	runTestCase(t, cacheConfig, 512)
+
+	cacheConfig.MaxNumberOfBlocksToSkipStateSaving = 0
+	cacheConfig.MaxAmountOfGasToSkipStateSaving = 15 * 1000 * 1000
+	runTestCase(t, cacheConfig, 512)
+
+	cacheConfig.MaxNumberOfBlocksToSkipStateSaving = 127
+	cacheConfig.MaxAmountOfGasToSkipStateSaving = 15 * 1000 * 1000
+	runTestCase(t, cacheConfig, 512)
+
+	// lower number of blocks in triegc below 100 blocks, to be able to check for nonexistence in testSkippingSavingStateAndRecreatingAfterRestart (it doesn't check last BlockCount blocks as some of them may be persisted on node shutdown)
+	cacheConfig.BlockCount = 16
+
+	testBlockGas := uint64(925000) // one test block ~ 925000 gas
+	skipBlockValues := []uint64{0, 1, 2, 3, 5, 21, 51, 100, 101}
+	var skipGasValues []uint64
+	for _, i := range skipBlockValues {
+		skipGasValues = append(skipGasValues, i*testBlockGas)
+	}
+	for _, skipGas := range skipGasValues {
+		for _, skipBlocks := range skipBlockValues[:len(skipBlockValues)-2] {
+			cacheConfig.MaxAmountOfGasToSkipStateSaving = skipGas
+			// #nosec G115
+			cacheConfig.MaxNumberOfBlocksToSkipStateSaving = uint32(skipBlocks)
+			runTestCase(t, cacheConfig, 100)
+		}
+	}
+}
+
+func testGettingState(t *testing.T, execConfig *gethexec.Config) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	builder, cancelNode := prepareNodeWithHistory(t, ctx, execConfig, 16)
+	execNode := builder.L2.ExecNode
+	defer cancelNode()
+	bc := execNode.Backend.ArbInterface().BlockChain()
+	api := execNode.Backend.APIBackend()
+
+	header := bc.CurrentBlock()
+	if header == nil {
+		Fatal(t, "failed to get current block header")
+	}
+	// #nosec G115
+	state, _, err := api.StateAndHeaderByNumber(ctx, rpc.BlockNumber(header.Number.Uint64()))
+	Require(t, err)
+	addr := builder.L2Info.GetAddress("User2")
+	exists := state.Exist(addr)
+	err = state.Error()
+	Require(t, err)
+	if !exists {
+		Fatal(t, "User2 address does not exist in the state")
+	}
+	// Get the state again to avoid caching
+	// #nosec G115
+	state, _, err = api.StateAndHeaderByNumber(ctx, rpc.BlockNumber(header.Number.Uint64()))
+	Require(t, err)
+
+	blockCountRequiredToFlushDirties := builder.execConfig.Caching.BlockCount
+	makeSomeTransfers(t, ctx, builder, blockCountRequiredToFlushDirties)
+
+	// force garbage collection to check if it won't break anything
+	runtime.GC()
+
+	exists = state.Exist(addr)
+	err = state.Error()
+	Require(t, err)
+	if !exists {
+		Fatal(t, "User2 address does not exist in the state")
+	}
+
+	// force garbage collection of StateDB object, what should cause the state finalizer to run
+	state = nil
+	runtime.GC()
+	_, err = bc.StateAt(header.Root)
+	if err == nil {
+		Fatal(t, "StateAndHeaderByNumber didn't failed as expected")
+	}
+	expectedErr := &trie.MissingNodeError{}
+	if !errors.As(err, &expectedErr) {
+		Fatal(t, "StateAndHeaderByNumber failed with unexpected error:", err)
+	}
+}
+
+func TestGettingState(t *testing.T) {
+	execConfig := ExecConfigDefaultTest(t)
+	execConfig.Caching.SnapshotCache = 0 // disable snapshots
+	execConfig.Caching.BlockAge = 0      // use only Caching.BlockCount to keep only last N blocks in dirties cache, no matter how new they are
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	t.Run("full-node", func(t *testing.T) {
+		testGettingState(t, execConfig)
+	})
+
+	execConfig = ExecConfigDefaultTest(t)
+	execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	execConfig.Caching.StateScheme = rawdb.HashScheme
+	execConfig.Caching.MaxNumberOfBlocksToSkipStateSaving = 128
+	execConfig.Caching.BlockCount = 128
+	execConfig.Caching.SnapshotCache = 0 // disable snapshots
+	execConfig.Caching.BlockAge = 0      // use only Caching.BlockCount to keep only last N blocks in dirties cache, no matter how new they are
+	execConfig.Sequencer.MaxBlockSpeed = 0
+	execConfig.Sequencer.MaxTxDataSize = 150 // 1 test tx ~= 110
+	t.Run("archive-node", func(t *testing.T) {
+		testGettingState(t, execConfig)
+	})
+}
+
+// regression test for issue caused by accessing block state that has just been committed to TrieDB but not yet referenced in core.BlockChain.writeBlockWithState (here called state of "recent" block)
+// before the corresponding fix, access to the recent block state caused premature garbage collection of the head block state
+func TestStateAndHeaderForRecentBlock(t *testing.T) {
+	threads := 32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	builder := NewNodeBuilder(ctx).DefaultConfig(t, true)
+	builder.execConfig.Caching.Archive = true
+	// For now Archive node should use HashScheme
+	builder.execConfig.Caching.StateScheme = rawdb.HashScheme
+	builder.execConfig.RPC.MaxRecreateStateDepth = 0
+	cleanup := builder.Build(t)
+	defer cleanup()
+	builder.L2Info.GenerateAccount("User2")
+
+	errors := make(chan error, threads+1)
+	senderDone := make(chan struct{})
+	go func() {
+		defer close(senderDone)
+		for ctx.Err() == nil {
+			tx := builder.L2Info.PrepareTx("Owner", "User2", builder.L2Info.TransferGas, new(big.Int).Lsh(big.NewInt(1), 128), nil)
+			err := builder.L2.Client.SendTransaction(ctx, tx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				errors <- err
+				return
+			}
+			_, err = builder.L2.EnsureTxSucceeded(tx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				errors <- err
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	api := builder.L2.ExecNode.Backend.APIBackend()
+	db := builder.L2.ExecNode.Backend.ChainDb()
+
+	recentBlock := 1
+	var mtx sync.RWMutex
+	var wgCallers sync.WaitGroup
+	for j := 0; j < threads && ctx.Err() == nil; j++ {
+		wgCallers.Add(1)
+		// each thread attempts to get state for a block that is just being created (here called recent):
+		// 1. Before state trie node is referenced in core.BlockChain.writeBlockWithState, block body is written to database with key prefix `b` followed by block number and then block hash (see: rawdb.blockBodyKey)
+		// 2. Each thread tries to read the block body entry to: a. extract recent block hash b. congest resource usage to slow down execution of core.BlockChain.writeBlockWithState
+		// 3. After extracting the hash from block body entry key, StateAndHeaderByNumberOfHash is called for the hash. It is expected that it will:
+		//		a. either fail with "ahead of current block" if we made it before rawdb.WriteCanonicalHash is called in core.BlockChain.writeHeadBlock, which is called after writeBlockWithState finishes,
+		// 		b. or it will succeed if the canonical hash was written for the block meaning that writeBlockWithState was fully executed (i.a. state root trie node correctly referenced) - then the recentBlock is advanced
+		go func() {
+			defer wgCallers.Done()
+			mtx.RLock()
+			blockNumber := recentBlock
+			mtx.RUnlock()
+			for blockNumber < 300 && ctx.Err() == nil {
+				prefix := make([]byte, 8)
+				binary.BigEndian.PutUint64(prefix, uint64(blockNumber))
+				prefix = append([]byte("b"), prefix...)
+				it := db.NewIterator(prefix, nil)
+				defer it.Release()
+				if it.Next() {
+					key := it.Key()
+					if len(key) != len(prefix)+common.HashLength {
+						Fatal(t, "Wrong key length, have:", len(key), "want:", len(prefix)+common.HashLength)
+					}
+					blockHash := common.BytesToHash(key[len(prefix):])
+					start := time.Now()
+					for ctx.Err() == nil {
+						_, _, err := api.StateAndHeaderByNumberOrHash(ctx, rpc.BlockNumberOrHash{BlockHash: &blockHash})
+						if err == nil {
+							mtx.Lock()
+							if blockNumber == recentBlock {
+								recentBlock++
+							}
+							mtx.Unlock()
+							break
+						}
+						if ctx.Err() != nil {
+							return
+						}
+						if !strings.Contains(err.Error(), "ahead of current block") {
+							errors <- err
+							return
+						}
+						if time.Since(start) > 5*time.Second {
+							errors <- fmt.Errorf("timeout - failed to get state for more then 5 seconds, block: %d, err: %w", blockNumber, err)
+							return
+						}
+					}
+				}
+				it.Release()
+				mtx.RLock()
+				blockNumber = recentBlock
+				mtx.RUnlock()
+			}
+		}()
+	}
+	callersDone := make(chan struct{})
+	go func() {
+		wgCallers.Wait()
+		close(callersDone)
+	}()
+
+	select {
+	case <-callersDone:
+		cancel()
+	case <-senderDone:
+		cancel()
+	case err := <-errors:
+		t.Error(err)
+		cancel()
+	}
+	<-callersDone
+	<-senderDone
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Error(err)
+		}
 	}
 }

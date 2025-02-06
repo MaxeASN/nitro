@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/offchainlabs/nitro/arbos/burn"
 	"github.com/offchainlabs/nitro/arbos/storage"
 	"github.com/offchainlabs/nitro/arbos/util"
@@ -64,7 +65,7 @@ func TestStorageBackedInt64(t *testing.T) {
 
 func TestStorageSlots(t *testing.T) {
 	state, _ := NewArbosMemoryBackedArbOSState()
-	sto := state.BackingStorage().OpenSubStorage([]byte{})
+	sto := state.BackingStorage().OpenCachedSubStorage([]byte{})
 
 	println("nil address", colors.Blue, storage.NilAddressRepresentation.String(), colors.Clear)
 

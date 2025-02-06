@@ -2,6 +2,7 @@ name: Arbitrator skip CI
 run-name: Arbitrator skip CI triggered from @${{ github.actor }} of ${{ github.head_ref }}
 
 on:
+  merge_group:
   pull_request:
     paths-ignore:
       - 'arbitrator/**'
@@ -12,7 +13,7 @@ on:
       - 'Makefile'
 
 jobs:
-  coverage:
+  arbitrator:
     name: Run Arbitrator tests
     runs-on: ubuntu-latest
     steps:

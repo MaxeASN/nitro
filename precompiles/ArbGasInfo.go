@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/params"
+
 	"github.com/offchainlabs/nitro/arbos/l1pricing"
 	"github.com/offchainlabs/nitro/arbos/storage"
 	"github.com/offchainlabs/nitro/util/arbmath"
@@ -28,7 +29,7 @@ func (con ArbGasInfo) GetPricesInWeiWithAggregator(
 	evm mech,
 	aggregator addr,
 ) (huge, huge, huge, huge, huge, huge, error) {
-	if c.State.ArbOSVersion() < 4 {
+	if c.State.ArbOSVersion() < params.ArbosVersion_4 {
 		return con._preVersion4_GetPricesInWeiWithAggregator(c, evm, aggregator)
 	}
 
@@ -36,7 +37,12 @@ func (con ArbGasInfo) GetPricesInWeiWithAggregator(
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	l2GasPrice := evm.Context.BaseFee
+	var l2GasPrice *big.Int
+	if evm.Context.BaseFeeInBlock != nil {
+		l2GasPrice = evm.Context.BaseFeeInBlock
+	} else {
+		l2GasPrice = evm.Context.BaseFee
+	}
 
 	// aggregators compress calldata, so we must estimate accordingly
 	weiForL1Calldata := arbmath.BigMulByUint(l1GasPrice, params.TxDataNonZeroGasEIP2028)
@@ -69,7 +75,12 @@ func (con ArbGasInfo) _preVersion4_GetPricesInWeiWithAggregator(
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	l2GasPrice := evm.Context.BaseFee
+	var l2GasPrice *big.Int
+	if evm.Context.BaseFeeInBlock != nil {
+		l2GasPrice = evm.Context.BaseFeeInBlock
+	} else {
+		l2GasPrice = evm.Context.BaseFee
+	}
 
 	// aggregators compress calldata, so we must estimate accordingly
 	weiForL1Calldata := arbmath.BigMulByUint(l1GasPrice, params.TxDataNonZeroGasEIP2028)
@@ -94,14 +105,19 @@ func (con ArbGasInfo) GetPricesInWei(c ctx, evm mech) (huge, huge, huge, huge, h
 
 // GetPricesInArbGasWithAggregator gets prices in ArbGas when using the provided aggregator
 func (con ArbGasInfo) GetPricesInArbGasWithAggregator(c ctx, evm mech, aggregator addr) (huge, huge, huge, error) {
-	if c.State.ArbOSVersion() < 4 {
+	if c.State.ArbOSVersion() < params.ArbosVersion_4 {
 		return con._preVersion4_GetPricesInArbGasWithAggregator(c, evm, aggregator)
 	}
 	l1GasPrice, err := c.State.L1PricingState().PricePerUnit()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	l2GasPrice := evm.Context.BaseFee
+	var l2GasPrice *big.Int
+	if evm.Context.BaseFeeInBlock != nil {
+		l2GasPrice = evm.Context.BaseFeeInBlock
+	} else {
+		l2GasPrice = evm.Context.BaseFee
+	}
 
 	// aggregators compress calldata, so we must estimate accordingly
 	weiForL1Calldata := arbmath.BigMulByUint(l1GasPrice, params.TxDataNonZeroGasEIP2028)
@@ -121,7 +137,12 @@ func (con ArbGasInfo) _preVersion4_GetPricesInArbGasWithAggregator(c ctx, evm me
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	l2GasPrice := evm.Context.BaseFee
+	var l2GasPrice *big.Int
+	if evm.Context.BaseFeeInBlock != nil {
+		l2GasPrice = evm.Context.BaseFeeInBlock
+	} else {
+		l2GasPrice = evm.Context.BaseFee
+	}
 
 	// aggregators compress calldata, so we must estimate accordingly
 	weiForL1Calldata := arbmath.BigMulByUint(l1GasPrice, params.TxDataNonZeroGasEIP2028)
@@ -164,12 +185,12 @@ func (con ArbGasInfo) GetL1BaseFeeEstimateInertia(c ctx, evm mech) (uint64, erro
 
 // GetL1RewardRate gets the L1 pricer reward rate
 func (con ArbGasInfo) GetL1RewardRate(c ctx, evm mech) (uint64, error) {
-	return c.State.L1PricingState().GetRewardsRate()
+	return c.State.L1PricingState().PerUnitReward()
 }
 
 // GetL1RewardRecipient gets the L1 pricer reward recipient
 func (con ArbGasInfo) GetL1RewardRecipient(c ctx, evm mech) (common.Address, error) {
-	return c.State.L1PricingState().GetRewardsRecepient()
+	return c.State.L1PricingState().PayRewardsTo()
 }
 
 // GetL1GasPriceEstimate gets the current estimate of the L1 basefee
@@ -187,7 +208,7 @@ func (con ArbGasInfo) GetGasBacklog(c ctx, evm mech) (uint64, error) {
 	return c.State.L2PricingState().GasBacklog()
 }
 
-// GetPricingInertia gets the L2 basefee in response to backlogged gas
+// GetPricingInertia gets how slowly ArbOS updates the L2 basefee in response to backlogged gas
 func (con ArbGasInfo) GetPricingInertia(c ctx, evm mech) (uint64, error) {
 	return c.State.L2PricingState().PricingInertia()
 }
@@ -197,25 +218,13 @@ func (con ArbGasInfo) GetGasBacklogTolerance(c ctx, evm mech) (uint64, error) {
 	return c.State.L2PricingState().BacklogTolerance()
 }
 
+// GetL1PricingSurplus gets the surplus of funds for L1 batch posting payments (may be negative)
 func (con ArbGasInfo) GetL1PricingSurplus(c ctx, evm mech) (*big.Int, error) {
-	if c.State.ArbOSVersion() < 10 {
+	if c.State.ArbOSVersion() < params.ArbosVersion_10 {
 		return con._preversion10_GetL1PricingSurplus(c, evm)
 	}
 	ps := c.State.L1PricingState()
-	fundsDueForRefunds, err := ps.BatchPosterTable().TotalFundsDue()
-	if err != nil {
-		return nil, err
-	}
-	fundsDueForRewards, err := ps.FundsDueForRewards()
-	if err != nil {
-		return nil, err
-	}
-	haveFunds, err := ps.L1FeesAvailable()
-	if err != nil {
-		return nil, err
-	}
-	needFunds := arbmath.BigAdd(fundsDueForRefunds, fundsDueForRewards)
-	return arbmath.BigSub(haveFunds, needFunds), nil
+	return ps.GetL1PricingSurplus()
 }
 
 func (con ArbGasInfo) _preversion10_GetL1PricingSurplus(c ctx, evm mech) (*big.Int, error) {
@@ -230,17 +239,45 @@ func (con ArbGasInfo) _preversion10_GetL1PricingSurplus(c ctx, evm mech) (*big.I
 	}
 	haveFunds := evm.StateDB.GetBalance(l1pricing.L1PricerFundsPoolAddress)
 	needFunds := arbmath.BigAdd(fundsDueForRefunds, fundsDueForRewards)
-	return arbmath.BigSub(haveFunds, needFunds), nil
+	return arbmath.BigSub(haveFunds.ToBig(), needFunds), nil
 }
 
+// GetPerBatchGasCharge gets the base charge (in L1 gas) attributed to each data batch in the calldata pricer
 func (con ArbGasInfo) GetPerBatchGasCharge(c ctx, evm mech) (int64, error) {
 	return c.State.L1PricingState().PerBatchGasCost()
 }
 
+// GetAmortizedCostCapBips gets the cost amortization cap in basis points
 func (con ArbGasInfo) GetAmortizedCostCapBips(c ctx, evm mech) (uint64, error) {
 	return c.State.L1PricingState().AmortizedCostCapBips()
 }
 
+// GetL1FeesAvailable gets the available funds from L1 fees
 func (con ArbGasInfo) GetL1FeesAvailable(c ctx, evm mech) (huge, error) {
 	return c.State.L1PricingState().L1FeesAvailable()
+}
+
+// GetL1PricingEquilibrationUnits gets the equilibration units parameter for L1 price adjustment algorithm
+func (con ArbGasInfo) GetL1PricingEquilibrationUnits(c ctx, evm mech) (*big.Int, error) {
+	return c.State.L1PricingState().EquilibrationUnits()
+}
+
+// GetLastL1PricingUpdateTime gets the last time the L1 calldata pricer was updated
+func (con ArbGasInfo) GetLastL1PricingUpdateTime(c ctx, evm mech) (uint64, error) {
+	return c.State.L1PricingState().LastUpdateTime()
+}
+
+// GetL1PricingFundsDueForRewards gets the amount of L1 calldata payments due for rewards (per the L1 reward rate)
+func (con ArbGasInfo) GetL1PricingFundsDueForRewards(c ctx, evm mech) (*big.Int, error) {
+	return c.State.L1PricingState().FundsDueForRewards()
+}
+
+// GetL1PricingUnitsSinceUpdate gets the amount of L1 calldata posted since the last update
+func (con ArbGasInfo) GetL1PricingUnitsSinceUpdate(c ctx, evm mech) (uint64, error) {
+	return c.State.L1PricingState().UnitsSinceUpdate()
+}
+
+// GetLastL1PricingSurplus gets the L1 pricing surplus as of the last update (may be negative)
+func (con ArbGasInfo) GetLastL1PricingSurplus(c ctx, evm mech) (*big.Int, error) {
+	return c.State.L1PricingState().LastSurplus()
 }
